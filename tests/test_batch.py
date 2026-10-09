@@ -1,4 +1,5 @@
 import csv
+from datetime import datetime, timedelta, timezone
 import json
 import os
 from pathlib import Path
@@ -14,7 +15,7 @@ import unittest
 from rvv_batch.backends import command, parse_lines, validate_elf
 from rvv_batch.docker import bind_mount, cpu_list
 from rvv_batch.make import arguments
-from rvv_batch.runner import discover
+from rvv_batch.runner import discover, parse_docker_timestamp
 from rvv_batch.store import CHUNK_BYTES, Store, run_lock
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -88,6 +89,22 @@ class BackendTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             arguments("resume", {"DB": "x", "WAVE": "1"})
         self.assertEqual(arguments("resume", {"DB": "x"}), ["resume", "x"])
+
+
+class TimestampTests(unittest.TestCase):
+    def test_docker_fractional_precision_and_timezones(self):
+        fractions = [("", 0), (".8", 800000), (".86", 860000), (".867", 867000),
+                     (".8670", 867000), (".86702", 867020), (".867021", 867021),
+                     (".8670213", 867021), (".86702137", 867021), (".867021375", 867021),
+                     (".999999999", 999999)]
+        offsets = [("Z", timedelta()), ("+00:00", timedelta()),
+                   ("+09:00", timedelta(hours=9)), ("-04:30", -timedelta(hours=4, minutes=30))]
+        for fraction, microsecond in fractions:
+            for suffix, offset in offsets:
+                stamp = "2026-10-09T09:30:53" + fraction + suffix
+                with self.subTest(timestamp=stamp):
+                    expected = datetime(2026, 10, 9, 9, 30, 53, microsecond, tzinfo=timezone(offset))
+                    self.assertEqual(parse_docker_timestamp(stamp), expected)
 
 
 class BatchIntegrationTests(unittest.TestCase):
@@ -238,6 +255,7 @@ class BatchIntegrationTests(unittest.TestCase):
             time.sleep(0.025)
         else:
             self.fail("simulator did not exit")
+        finished_at = json.loads(files[0].read_text())["State"]["FinishedAt"]
         process.kill()
         process.wait(timeout=5)
         result = self.invoke(resume=True)
@@ -246,6 +264,7 @@ class BatchIntegrationTests(unittest.TestCase):
         self.assertEqual(row["attempt_count"], 1)
         self.assertEqual(row["status"], "succeeded")
         self.assertEqual(row["total_cycle"], 456)
+        self.assertEqual(row["finished_at"], finished_at[:23] + "+00:00")
 
     def test_killed_controller_recovers_live_container_and_preserves_input(self):
         self.add("a-ok.elf")

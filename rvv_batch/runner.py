@@ -6,12 +6,21 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import signal
 import time
 
 from .backends import command, parse_lines, validate_elf
 from .store import now
+
+
+def parse_docker_timestamp(value):
+    """Parse Docker's RFC3339Nano timestamps on Python 3.10 and newer."""
+    # Python 3.10 only accepts three or six fractional digits. Docker can emit
+    # up to nine; truncate to datetime's microseconds and pad shorter fractions.
+    value = re.sub(r"\.(\d+)", lambda match: "." + match[1][:6].ljust(6, "0"), value)
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
 def discover(root, output):
@@ -137,7 +146,7 @@ class Runner:
         attempt = self.db.execute("SELECT * FROM attempts WHERE attempt_id=?", (attempt_id,)).fetchone()
         ended = now()
         if state.get("FinishedAt"):
-            candidate = datetime.fromisoformat(state["FinishedAt"].replace("Z", "+00:00"))
+            candidate = parse_docker_timestamp(state["FinishedAt"])
             if candidate >= datetime.fromisoformat(attempt["started_at"]):
                 ended = candidate.isoformat(timespec="milliseconds")
         wall = max(0, (datetime.fromisoformat(ended) - datetime.fromisoformat(attempt["started_at"])).total_seconds())

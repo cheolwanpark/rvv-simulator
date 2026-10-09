@@ -40,7 +40,10 @@ def simulation(name):
 
     def finish(code):
         state = read(name)
-        state["State"] = dict(Status="exited", Running=False, ExitCode=code, OOMKilled=False, Error="")
+        seconds, nanoseconds = divmod(time.time_ns(), 10**9)
+        finished = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(seconds)) + f".{nanoseconds:09d}Z"
+        state["State"] = dict(Status="exited", Running=False, ExitCode=code, OOMKilled=False,
+                              Error="", FinishedAt=finished)
         save(state)
 
     def stop(sig, frame):
