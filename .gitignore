@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+results/
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite.lock
+*.sqlite.work/
+*.sqlite.artifacts/
