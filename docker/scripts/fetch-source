@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [ "$#" != 3 ] || ! [[ "$2" =~ ^[0-9a-f]{40}$ ]]; then
+    echo 'usage: fetch-source REPOSITORY FULL_COMMIT DESTINATION' >&2
+    exit 2
+fi
+
+git init -q "$3"
+git -C "$3" remote add origin "$1"
+git -C "$3" fetch --depth 1 origin "$2"
+git -C "$3" checkout -q --detach FETCH_HEAD
+test "$(git -C "$3" rev-parse HEAD)" = "$2"

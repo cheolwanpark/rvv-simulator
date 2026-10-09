@@ -1,0 +1,122 @@
+#!/usr/bin/env python3
+"""Conservative per-stage concurrency using the Linux builder's resource limits."""
+
+import argparse
+import json
+import os
+from pathlib import Path
+import re
+import sys
+
+GIB = 1024 ** 3
+# (maximum useful workers, GiB per worker). Tuning budgets, not measured peak
+# RSS. Reserve 25% (at least 2 GiB) for OS, parent processes and JVM overhead.
+# These caps limit diminishing returns even on very large builders.
+STAGES = {
+    "fetch": (4, 0.25),
+    "verilator": (8, 1),
+    "nemu": (8, 0.5),
+    "espresso": (4, 0.5),
+    "spike": (8, 1),
+    "libgloss": (4, 0.5),
+    "benchmarks": (4, 0.5),
+    "scala": (4, 2),
+    "xiangshan": (8, 3),
+    "saturn": (8, 2),
+    "saturn-trace": (4, 3),
+}
+
+
+def read(path):
+    try:
+        return Path(path).read_text().strip()
+    except OSError:
+        return ""
+
+
+def cgroup_dirs(proc=Path("/proc"), root=Path("/sys/fs/cgroup")):
+    # Root files cover namespaced containers; /proc/self/cgroup covers runners
+    # exposing the host hierarchy. Include ancestors since limits can nest.
+    directories = {root, root / "cpu", root / "cpu,cpuacct", root / "memory"}
+    for line in read(proc / "self/cgroup").splitlines():
+        _, controllers, location = line.split(":", 2)
+        if ".." in Path(location).parts:
+            continue
+        bases = [root] if not controllers else [root / controllers, *[root / c for c in controllers.split(",")]]
+        for base in bases:
+            path = base / location.lstrip("/")
+            while path != base and base in path.parents:
+                directories.add(path)
+                path = path.parent
+            directories.add(base)
+    return directories
+
+
+def resources(proc=Path("/proc"), root=Path("/sys/fs/cgroup")):
+    cpus = os.cpu_count() or 1
+    if hasattr(os, "sched_getaffinity"):
+        cpus = min(cpus, len(os.sched_getaffinity(0)))
+    match = re.search(r"^MemTotal:\s+(\d+)\s+kB$", read(proc / "meminfo"), re.M)
+    if not match:
+        raise ValueError("cannot read builder memory limits from /proc/meminfo")
+    memory = int(match.group(1)) * 1024
+    for directory in cgroup_dirs(proc, root):
+        quota = read(directory / "cpu.max").split()
+        if len(quota) == 2 and quota[0] != "max":
+            cpus = min(cpus, max(1, int(quota[0]) // int(quota[1])))
+        quota_v1 = read(directory / "cpu.cfs_quota_us")
+        period_v1 = read(directory / "cpu.cfs_period_us")
+        if quota_v1 and period_v1 and int(quota_v1) > 0:
+            cpus = min(cpus, max(1, int(quota_v1) // int(period_v1)))
+        for name in ("memory.max", "memory.high", "memory.limit_in_bytes"):
+            value = read(directory / name)
+            if value.isdigit() and int(value) > 0:
+                memory = min(memory, int(value))
+    return max(1, cpus), memory
+
+
+def select(stage, cpus, memory, override="auto"):
+    cap, per_worker = STAGES[stage]
+    budget = max(0, memory - max(2 * GIB, memory // 4))
+    jobs = max(1, min(cpus, cap, int(budget / (per_worker * GIB))))
+    if override != "auto":
+        if not re.fullmatch(r"[1-9][0-9]*", override):
+            raise ValueError("BUILD_JOBS must be a positive integer or auto")
+        # An extra ceiling, not permission to overcommit the builder.
+        jobs = min(jobs, int(override))
+    return jobs
+
+
+def heap(family, memory):
+    maximum = (40 if family == "xiangshan" else 8) * 1024
+    return f"{max(256, min(maximum, int(memory / 1024 ** 2 * 0.60)))}M"
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("stage", nargs="?", choices=STAGES)
+    parser.add_argument("--heap", choices=("xiangshan", "saturn"))
+    parser.add_argument("--report", action="store_true")
+    args = parser.parse_args()
+    cpus, memory = resources()
+    override = os.environ.get("BUILD_JOBS", "auto")
+    if args.report:
+        print(json.dumps({"cpus": cpus, "memory_gib": memory / GIB,
+                          "jobs": {s: select(s, cpus, memory, override) for s in STAGES},
+                          "xiangshan_heap": heap("xiangshan", memory),
+                          "saturn_heap": heap("saturn", memory)}, indent=2))
+    elif args.heap:
+        print(heap(args.heap, memory))
+    elif args.stage:
+        jobs = select(args.stage, cpus, memory, override)
+        print(f"build-jobs: {args.stage}: {jobs} workers (builder: {cpus} CPUs, {memory / GIB:.1f} GiB)", file=sys.stderr)
+        print(jobs)
+    else:
+        parser.error("specify a stage, --heap, or --report")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except ValueError as error:
+        sys.exit(str(error))

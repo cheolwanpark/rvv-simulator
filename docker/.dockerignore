@@ -1,0 +1,14 @@
+**
+!scripts/
+!scripts/**
+!xiangshan/
+!xiangshan/Dockerfile
+!xiangshan/xs-run
+!saturn/
+!saturn/Dockerfile
+!saturn/*.sh
+!saturn/saturn-run
+!saturn/patches/
+!saturn/patches/*.patch
+**/__pycache__/
+**/*.pyc

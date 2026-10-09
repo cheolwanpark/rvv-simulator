@@ -1,0 +1,9 @@
+diff --git a/generators/rocket-chip/src/main/resources/vsrc/TestDriver.v b/generators/rocket-chip/src/main/resources/vsrc/TestDriver.v
+index 70f728e..5cc9f82 100644
+--- a/generators/rocket-chip/src/main/resources/vsrc/TestDriver.v
++++ b/generators/rocket-chip/src/main/resources/vsrc/TestDriver.v
+@@ -150,3 +150,4 @@ module TestDriver;
+       if (success)
+       begin
++        $display("SATURN simulation cycleCnt = %0d", trace_count);
+         if (verbose)

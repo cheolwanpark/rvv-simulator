@@ -1,0 +1,11 @@
+diff --git a/generators/saturn/chipyard/SaturnConfigs.scala b/generators/saturn/chipyard/SaturnConfigs.scala
+index 35682b2..8b219ef 100644
+--- a/generators/saturn/chipyard/SaturnConfigs.scala
++++ b/generators/saturn/chipyard/SaturnConfigs.scala
+@@ -105,4 +105,5 @@ class GENV256D128ShuttleConfig extends Config(
+-  new saturn.shuttle.WithShuttleVectorUnit(256, 128, VectorParams.genParams) ++
++  new saturn.shuttle.WithShuttleVectorUnit(
++    256, 128, VectorParams.genParams.copy(pipelinedVatClear = true)) ++
+   new chipyard.config.WithSystemBusWidth(128) ++
+   new shuttle.common.WithShuttleTileBeatBytes(16) ++
+   new shuttle.common.WithNShuttleCores(1) ++

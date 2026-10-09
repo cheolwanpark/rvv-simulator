@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+set -euo pipefail
+show_logs() {
+    local log
+    for log in /host/*.log; do
+        [ -f "$log" ] || continue
+        echo "=== $log ===" >&2
+        tail -n 80 "$log" >&2
+    done
+}
+trap show_logs ERR
+
+for tool in gcc g++ clang javac java mill sbt conda node npm verilator; do
+    if command -v "$tool" >/dev/null; then
+        echo "Unexpected development tool in runtime: $tool" >&2
+        exit 1
+    fi
+done
+test ! -d /workspace/XiangShan/src
+test ! -f /workspace/Chipyard/build.sbt
+test ! -d /workspace/Chipyard/.conda-env/bin
+test ! -d /opt/conda
+
+case "$1" in
+    xiangshan)
+        check-runtime "$XIANSHAN_HOME/build/emu" "$NEMU_HOME/build/riscv64-nemu-interpreter" \
+            "$XIANSHAN_HOME"/ready-to-run/*-so
+        xs-run --list
+        xs-run --dry-run
+        timeout 600 xs-run --workload microbench --max-cycles 10000000 > microbench.log 2>&1
+        grep -q 'HIT GOOD TRAP' microbench.log
+        timeout 600 xs-run --workload coremark --max-cycles 10000000 \
+            --wave --log-begin 0 --log-end 10000 --wave-path /host/smoke.fst > coremark.log 2>&1
+        grep -q 'HIT GOOD TRAP' coremark.log
+        timeout 120 "$NEMU_HOME/build/riscv64-nemu-interpreter" -b \
+            "$XIANSHAN_HOME/ready-to-run/microbench.bin" > nemu.log 2>&1
+        grep -q 'HIT GOOD TRAP' nemu.log
+        # Also exercise dlopen of the alternate advertised reference models.
+        for ref in nemu-debug spike; do
+            timeout 600 xs-run --ref "$ref" --workload microbench --max-cycles 10000000 > "$ref.log" 2>&1
+            grep -q 'HIT GOOD TRAP' "$ref.log"
+        done
+        ;;
+    saturn)
+        check-runtime /opt/saturn-rtl/bin/saturn-sim /opt/saturn-rtl/bin/saturn-sim-trace
+        saturn-run --list
+        saturn-run --dry-run
+        timeout 600 saturn-run --workload vec-daxpy > daxpy.log 2>&1
+        grep -q 'SATURN simulation cycleCnt = ' daxpy.log
+        timeout 600 saturn-run --workload vec-strlen --max-cycles 20000000 \
+            --wave --wave-path /host/smoke.fst > strlen.log 2>&1
+        grep -q 'SATURN simulation cycleCnt = ' strlen.log
+        ;;
+    *) echo "Unknown image family: $1" >&2; exit 2 ;;
+esac
+test -s /host/smoke.fst
+echo 'Runtime smoke checks passed.'

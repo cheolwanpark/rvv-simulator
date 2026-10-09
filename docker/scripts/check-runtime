@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+for binary in "$@"; do
+    output=$(LC_ALL=C ldd "$binary" 2>&1) || {
+        if [[ "$output" != *'statically linked'* ]]; then
+            printf '%s\n%s\n' "$binary" "$output" >&2
+            exit 1
+        fi
+    }
+    if [[ "$output" == *'not found'* ]]; then
+        printf '%s\n%s\n' "$binary" "$output" >&2
+        exit 1
+    fi
+done

@@ -1,0 +1,204 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+    cat <<'USAGE'
+usage:
+  xs-run [options] [-- emu-args...]
+
+workloads:
+  microbench        ready-to-run/microbench.bin (default)
+  coremark          ready-to-run/coremark-2-iteration.bin
+  copy-and-run      ready-to-run/copy_and_run.bin
+  linux             ready-to-run/linux.bin
+  flash-recursion   ready-to-run/flash_recursion_test.bin
+  PATH              custom workload path
+
+refs:
+  nemu              ready-to-run/riscv64-nemu-interpreter-so (default)
+  nemu-debug        ready-to-run/riscv64-nemu-interpreter-debug-so
+  spike             ready-to-run/riscv64-spike-so
+  none              disable difftest
+  PATH              custom reference shared object
+
+options:
+  --workload NAME|PATH
+  --ref NAME|PATH
+  --no-diff
+  --max-cycles N
+  --max-instr N
+  --log-begin N
+  --log-end N
+  --wave
+  --wave-path PATH
+  --ram-size SIZE
+  --seed N
+  --list
+  --dry-run
+  -h, --help
+USAGE
+}
+
+die() {
+    echo "xs-run: $*" >&2
+    exit 2
+}
+
+xs_home=${XIANSHAN_HOME:-/workspace/XiangShan}
+emu=${XS_EMU:-"$xs_home/build/emu"}
+ready="$xs_home/ready-to-run"
+
+workload=microbench
+ref=nemu
+enable_diff=1
+dry_run=0
+args=()
+
+resolve_workload() {
+    case "$1" in
+        microbench) printf '%s\n' "$ready/microbench.bin" ;;
+        coremark) printf '%s\n' "$ready/coremark-2-iteration.bin" ;;
+        copy-and-run) printf '%s\n' "$ready/copy_and_run.bin" ;;
+        linux) printf '%s\n' "$ready/linux.bin" ;;
+        flash-recursion) printf '%s\n' "$ready/flash_recursion_test.bin" ;;
+        *) printf '%s\n' "$1" ;;
+    esac
+}
+
+resolve_ref() {
+    case "$1" in
+        nemu) printf '%s\n' "$ready/riscv64-nemu-interpreter-so" ;;
+        nemu-debug) printf '%s\n' "$ready/riscv64-nemu-interpreter-debug-so" ;;
+        spike) printf '%s\n' "$ready/riscv64-spike-so" ;;
+        none) printf '%s\n' "" ;;
+        *) printf '%s\n' "$1" ;;
+    esac
+}
+
+print_list() {
+    cat <<EOF
+workloads:
+  microbench        $ready/microbench.bin
+  coremark          $ready/coremark-2-iteration.bin
+  copy-and-run      $ready/copy_and_run.bin
+  linux             $ready/linux.bin
+  flash-recursion   $ready/flash_recursion_test.bin
+
+refs:
+  nemu              $ready/riscv64-nemu-interpreter-so
+  nemu-debug        $ready/riscv64-nemu-interpreter-debug-so
+  spike             $ready/riscv64-spike-so
+  none
+EOF
+}
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --workload)
+            [ "$#" -ge 2 ] || die "--workload needs value"
+            workload=$2
+            shift 2
+            ;;
+        --ref)
+            [ "$#" -ge 2 ] || die "--ref needs value"
+            ref=$2
+            shift 2
+            ;;
+        --no-diff)
+            enable_diff=0
+            shift
+            ;;
+        --max-cycles)
+            [ "$#" -ge 2 ] || die "--max-cycles needs value"
+            args+=("--max-cycles" "$2")
+            shift 2
+            ;;
+        --max-instr)
+            [ "$#" -ge 2 ] || die "--max-instr needs value"
+            args+=("--max-instr" "$2")
+            shift 2
+            ;;
+        --log-begin)
+            [ "$#" -ge 2 ] || die "--log-begin needs value"
+            args+=("--log-begin" "$2")
+            shift 2
+            ;;
+        --log-end)
+            [ "$#" -ge 2 ] || die "--log-end needs value"
+            args+=("--log-end" "$2")
+            shift 2
+            ;;
+        --wave)
+            args+=("--dump-wave")
+            shift
+            ;;
+        --wave-path)
+            [ "$#" -ge 2 ] || die "--wave-path needs value"
+            args+=("--wave-path" "$2")
+            shift 2
+            ;;
+        --ram-size)
+            [ "$#" -ge 2 ] || die "--ram-size needs value"
+            args+=("--ram-size" "$2")
+            shift 2
+            ;;
+        --seed)
+            [ "$#" -ge 2 ] || die "--seed needs value"
+            args+=("--seed" "$2")
+            shift 2
+            ;;
+        --list)
+            print_list
+            exit 0
+            ;;
+        --dry-run)
+            dry_run=1
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        --)
+            shift
+            args+=("$@")
+            break
+            ;;
+        *)
+            die "unknown option: $1"
+            ;;
+    esac
+done
+
+[ -x "$emu" ] || die "emu not executable: $emu"
+
+workload_path=$(resolve_workload "$workload")
+[ -f "$workload_path" ] || die "workload not found: $workload_path"
+
+cmd=("$emu" "-i" "$workload_path")
+
+if [ "$enable_diff" = 1 ]; then
+    ref_path=$(resolve_ref "$ref")
+    if [ -n "$ref_path" ]; then
+        [ -f "$ref_path" ] || die "ref not found: $ref_path"
+        cmd+=("--diff" "$ref_path")
+    else
+        cmd+=("--no-diff")
+    fi
+else
+    cmd+=("--no-diff")
+fi
+
+if [ "${#args[@]}" -gt 0 ]; then
+    cmd+=("${args[@]}")
+fi
+
+if [ "$dry_run" = 1 ]; then
+    printf '%q ' "${cmd[@]}"
+    printf '\n'
+    exit 0
+fi
+
+# RTL-server redirects output to regular files. Preserve progress up to a wall
+# timeout instead of losing the emulator's fully buffered stdio on termination.
+exec stdbuf -oL -e0 "${cmd[@]}"
