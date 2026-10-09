@@ -1,12 +1,13 @@
 """Simulator commands, ELF checks and versioned output parsing."""
 
 from dataclasses import dataclass, field
+import json
 import math
 import re
 import struct
 
 BACKENDS = ("xiangshan-v2", "xiangshan-v3", "saturn")
-PARSER_VERSION = 1
+PARSER_VERSION = 2
 ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 NUMBER = r"[0-9][0-9,']*"
 CORE = re.compile(
@@ -81,6 +82,31 @@ class Parsed:
         self.measurements.append((metric, scope, name, value, stream, line_no, source))
 
 
+def parse_loop_benchmark(text, result, stream, line_no):
+    """Read the JSON line emitted by loop-benchmarks/tools/rvv_main.c."""
+    if not text.startswith("{") or '"schema_version"' not in text:
+        return
+    try:
+        record = json.loads(text)
+    except ValueError:
+        result.errors.append(f"{stream}:{line_no}: malformed loop-benchmarks kernel_cycle JSON")
+        return
+    # Hosted benchmarks report elapsed_ns; never treat those values as cycles.
+    if record.get("metric") != "cycles":
+        return
+    if (type(record.get("schema_version")) is not int or record["schema_version"] != 2
+            or record.get("mode") not in ("kernel", "full")
+            or type(record.get("repetitions")) is not int or record["repetitions"] < 1
+            or type(record.get("warmups")) is not int or record["warmups"] < 0
+            or type(record.get("value")) is not int):
+        result.errors.append(f"{stream}:{line_no}: invalid loop-benchmarks kernel_cycle record")
+        return
+    # Both modes time only bench_kernel calls. value is the sum over repetitions,
+    # excluding warmups; preserve that sum without averaging or subtracting overhead.
+    result.add("kernel_cycle", "bench_kernel", record["value"], stream, line_no,
+               "loop-benchmarks.v2", "kernel")
+
+
 def parse_lines(backend, lines):
     """lines yields (stream, line number, text); retain every recognized sample."""
     result = Parsed()
@@ -96,6 +122,7 @@ def parse_lines(backend, lines):
                        "RVV_KERNEL", "kernel")
         elif "RVV_KERNEL" in text:
             result.errors.append(f"{stream}:{line_no}: malformed RVV_KERNEL marker")
+        parse_loop_benchmark(text, result, stream, line_no)
         if backend.startswith("xiangshan"):
             result.good |= "HIT GOOD TRAP" in text
             result.bad |= any(term in text for term in ("HIT BAD TRAP", "ABORT at pc", "DIFFTEST MISMATCH"))

@@ -84,7 +84,7 @@ shown as `kernel_cycle=multiple(N)`; missing samples as `kernel_cycle=null`.
 | --- | --- |
 | XiangShan total cycle | final non-warmup `Core-0 ... cycleCnt` |
 | Saturn total cycle | patched `SATURN simulation cycleCnt`, the TestDriver counter |
-| Kernel cycle | guest-reported `rdcycle` difference from the marker below |
+| Kernel cycle | guest-reported cycle difference from loop-benchmarks JSON or the marker below |
 | Wall seconds | host time from attempt creation to container exit, including container startup |
 
 The two total counters have their backend-specific boot/reset/harness scopes.
@@ -92,7 +92,20 @@ They are not substituted for kernel cycles. XiangShan's other core counts,
 instruction counts, IPC, warmup counts and `Guest cycle spent`, and Saturn's
 termination-reported counts are also retained as separate measurements.
 
-To report a kernel measurement, emit a complete line:
+The JSON output of `loop-benchmarks/tools/rvv_main.c` is supported directly:
+
+```json
+{"schema_version":2,"mode":"kernel","seed":0,"repetitions":1,"warmups":0,"metric":"cycles","value":47424,"numerical_validation":"not_run"}
+```
+
+For schema version 2, `metric="cycles"` and mode `kernel` or `full`, `value` becomes
+`kernel_cycle`, with measurement name `bench_kernel` and source `loop-benchmarks.v2`.
+Both modes measure only kernel calls: the value is the sum over `repetitions`,
+excluding warmups. It is not divided by the repetition count. The hosted
+`metric="elapsed_ns"` output is ignored. Invalid cycle records generate measurement
+errors. The original JSON, including repetition and warmup counts, remains in logs.
+
+Alternatively, emit a complete marker line:
 
 ```text
 RVV_KERNEL name=matmul cycles=123456
@@ -136,6 +149,8 @@ does not subtract overhead or infer a warmup policy.
 
 See [the schema contract](docs/sqlite-schema.md) for columns, statuses and recovery
 semantics. `PRAGMA user_version` and `run.schema_version` are both `1`.
+The output parser version is `2`; databases created with parser version `1`
+require the original tool version for resume. Existing results are not reparsed.
 
 ```sh
 sqlite3 -header -column results/experiment.sqlite \

@@ -12,7 +12,7 @@ import tempfile
 import time
 import unittest
 
-from rvv_batch.backends import command, parse_lines, validate_elf
+from rvv_batch.backends import PARSER_VERSION, command, parse_lines, validate_elf
 from rvv_batch.docker import bind_mount, cpu_list
 from rvv_batch.make import arguments
 from rvv_batch.runner import discover, parse_docker_timestamp
@@ -20,6 +20,13 @@ from rvv_batch.store import CHUNK_BYTES, Store, run_lock
 
 ROOT = Path(__file__).resolve().parents[1]
 FAKE = ROOT / "tests" / "fake_docker.py"
+
+
+def loop_record(**changes):
+    record = dict(schema_version=2, mode="kernel", seed=0, repetitions=1,
+                  warmups=0, metric="cycles", value=47424, numerical_validation="not_run")
+    record.update(changes)
+    return json.dumps(record)
 
 
 def elf(scenario="ok"):
@@ -66,6 +73,45 @@ class BackendTests(unittest.TestCase):
         ])
         self.assertTrue(parsed.bad and parsed.limit)
         self.assertEqual(len(parsed.errors), 2)
+
+    def test_loop_benchmark_cycles_on_all_backends(self):
+        for backend in ("xiangshan-v2", "xiangshan-v3", "saturn"):
+            with self.subTest(backend=backend):
+                parsed = parse_lines(backend, [
+                    ("stdout", 7, "\x1b[0m" + loop_record() + "\r"),
+                    ("stderr", 9, loop_record(mode="full", repetitions=32, warmups=1, value=98765)),
+                    ("stdout", 10, loop_record(value=0)),
+                ])
+                self.assertEqual(parsed.errors, [])
+                self.assertEqual(parsed.measurements, [
+                    ("kernel_cycle", "kernel", "bench_kernel", value, stream, line, "loop-benchmarks.v2")
+                    for value, stream, line in [(47424, "stdout", 7), (98765, "stderr", 9), (0, "stdout", 10)]
+                ])
+                self.assertFalse(parsed.good)  # Measurements alone do not prove completion.
+
+    def test_loop_benchmark_rejects_invalid_records(self):
+        invalid = [loop_record(**change) for change in [
+            {"schema_version": 1}, {"schema_version": 2.0}, {"mode": "unknown"},
+            {"repetitions": 0}, {"repetitions": True}, {"warmups": -1}, {"warmups": 0.5},
+            {"value": True}, {"value": "123"}, {"value": 1.5}, {"value": None},
+            {"value": -1}, {"value": 2**63}, {"value": float("nan")},
+        ]]
+        invalid += [loop_record()[:-5], loop_record().replace("47424", "9" * 5000)]
+        for line in invalid:
+            with self.subTest(line=line[:180]):
+                parsed = parse_lines("xiangshan-v2", [("stdout", 1, line)])
+                self.assertEqual(parsed.measurements, [])
+                self.assertEqual(len(parsed.errors), 1)
+                self.assertIn("kernel_cycle", parsed.errors[0])
+
+    def test_loop_benchmark_ignores_hosted_time_and_unrelated_json(self):
+        parsed = parse_lines("saturn", [
+            ("stdout", 1, loop_record(metric="elapsed_ns")),
+            ("stdout", 2, '{"status":"ready"}'),
+            ("stdout", 3, '{"schema_version":2,"status":"ready"}'),
+        ])
+        self.assertEqual(parsed.measurements, [])
+        self.assertEqual(parsed.errors, [])
 
     def test_default_wave_disabled_and_cpuset_validation(self):
         for backend in ("xiangshan-v2", "xiangshan-v3", "saturn"):
@@ -202,6 +248,23 @@ class BatchIntegrationTests(unittest.TestCase):
         self.assertIsNone(wave["data"])
         self.assertEqual((self.database.parent / wave["relative_path"]).read_bytes(), b"fixture FST\x00\xff")
         self.assertEqual(db.execute("SELECT total_cycle FROM job_results").fetchone()[0], 456)
+
+    def test_loop_benchmark_json_is_stored_and_invalid_is_reported(self):
+        self.add("a-loop.elf", "loop-json")
+        self.add("b-invalid.elf", "loop-json-invalid")
+        result = self.invoke("--jobs", "2")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("total_cycle=456 kernel_cycle=123 status=succeeded", result.stdout)
+        db = self.connection()
+        rows = db.execute("SELECT * FROM job_results ORDER BY job_id").fetchall()
+        self.assertEqual((rows[0]["kernel_cycle"], rows[0]["kernel_sample_count"],
+                          rows[0]["kernel_status"], rows[0]["measurement_status"]),
+                         (123, 1, "available", "complete"))
+        self.assertEqual((rows[1]["kernel_status"], rows[1]["measurement_status"]), ("invalid", "invalid"))
+        sample = db.execute("SELECT name,source,source_stream FROM measurements WHERE metric='kernel_cycle'").fetchone()
+        self.assertEqual(tuple(sample), ("bench_kernel", "loop-benchmarks.v2", "stdout"))
+        self.assertEqual(db.execute("SELECT parser_version FROM run").fetchone()[0], PARSER_VERSION)
+        self.assertEqual(db.execute("SELECT COUNT(*) FROM events WHERE kind='measurement_error'").fetchone()[0], 1)
 
     def test_timeout_and_invalid_elf_continue(self):
         self.add("a-long.elf", "long")

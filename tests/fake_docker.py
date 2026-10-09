@@ -54,7 +54,16 @@ def simulation(name):
     try:
         with (output / "stdout.log").open("w", buffering=1) as stdout, (output / "stderr.log").open("w", buffering=1) as stderr:
             stdout.write("fixture start 한글\n")
-            if "multiple" in scenario:
+            if "loop-json" in scenario:
+                record = json.dumps(dict(schema_version=2, mode="kernel", seed=0, repetitions=1,
+                                         warmups=0, metric="cycles", value=-1 if "invalid" in scenario else 123,
+                                         numerical_validation="not_run")) + "\n"
+                # Guest UART output arrives across polling boundaries, not whole lines.
+                stdout.write(record[:37])
+                stdout.flush()
+                time.sleep(0.3)
+                stdout.write(record[37:])
+            elif "multiple" in scenario:
                 stdout.write("RVV_KERNEL name=first cycles=11\nRVV_KERNEL name=second cycles=22\n")
             elif "missing" not in scenario:
                 stdout.write("RVV_KERNEL name=kernel cycles=123\n")

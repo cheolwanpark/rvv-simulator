@@ -64,6 +64,15 @@ as measurements, with events and original logs retained.
 | `cycle` | `simulation`, `simulation` | Saturn patched `trace_count` |
 | `reported_cycle` | `simulation`, `simulation` | Saturn PASSED/FAILED cycle report |
 | `kernel_cycle` | `kernel`, marker's name | `RVV_KERNEL name=... cycles=...` |
+| `kernel_cycle` | `kernel`, `bench_kernel` | `loop-benchmarks.v2`: schema 2 JSON with `metric="cycles"`, mode `kernel` or `full`, integer `value` |
+
+Parser version 2 accepts loop-benchmarks JSON. Its `value` is the sum of measured
+kernel cycles over `repetitions` (positive integer), excluding `warmups` (nonnegative
+integer), in either mode. The parser preserves this sum without averaging; the
+original JSON and its metadata remain in `logs`. Hosted `elapsed_ns` values are
+not cycle measurements. Invalid cycle records produce `measurement_error` events
+and invalid kernel/measurement statuses. The schema version remains 1; resume
+requires the same parser version as the original request.
 
 The final non-warmup core-0 `cycle` becomes XiangShan's `total_cycle`. Saturn uses
 the final patched `cycle`; `reported_cycle` is not silently used as a substitute.
