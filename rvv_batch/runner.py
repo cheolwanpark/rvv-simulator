@@ -80,6 +80,11 @@ class Runner:
         self.active = {}
         self.stop_signal = None
         self.total = self.db.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+        self.finished = self.db.execute(
+            "SELECT COUNT(*) FROM job_results WHERE status NOT IN "
+            "('pending','starting','running','stopping','interrupted')"
+        ).fetchone()[0]
+        self.started = self.finished
 
     def work(self, attempt_id):
         return self.work_root / str(attempt_id)
@@ -182,7 +187,9 @@ class Runner:
         kernel_text = str(kernels[0]) if len(kernels) == 1 else f"multiple({len(kernels)})" if kernels else "null"
         # Escape control characters without obscuring ordinary spaces and Unicode names.
         name = json.dumps(name, ensure_ascii=False)[1:-1]
-        self.output(f"finish [{attempt['job_id']}/{self.total}] {name} "
+        if status != "interrupted":
+            self.finished += 1
+        self.output(f"finish [{self.finished}/{self.total}] {name} "
                     f"total_cycle={total_cycle if total_cycle is not None else 'null'} "
                     f"kernel_cycle={kernel_text} status={status}", flush=True)
 
@@ -229,7 +236,8 @@ class Runner:
             self.db.execute("UPDATE attempts SET container_name=? WHERE attempt_id=?", (name, attempt_id))
             self.store.event("start", job["name"], attempt_id)
         escaped = json.dumps(job["name"], ensure_ascii=False)[1:-1]
-        self.output(f"start [{job['job_id']}/{self.total}] {escaped}", flush=True)
+        self.started += 1
+        self.output(f"start [{self.started}/{self.total}] {escaped}", flush=True)
         work = self.work(attempt_id)
         (work / "input").mkdir(parents=True)
         (work / "output").mkdir()
@@ -254,6 +262,7 @@ class Runner:
         previous_handlers = {sig: signal.signal(sig, self.signal) for sig in (signal.SIGINT, signal.SIGTERM)}
         try:
             self.recover()
+            self.started = self.finished
             pending = self.db.execute(
                 "SELECT j.* FROM jobs j JOIN job_results r USING(job_id) WHERE r.status IN ('pending','interrupted') ORDER BY j.job_id"
             ).fetchall()

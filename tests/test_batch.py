@@ -276,6 +276,19 @@ class BatchIntegrationTests(unittest.TestCase):
         self.assertEqual([r["status"] for r in rows], ["timeout", "succeeded", "invalid_input"])
         self.assertEqual(rows[0]["kernel_cycle"], 123)
 
+    def test_progress_counts_completions_independently_of_job_ids(self):
+        self.add("a-long.elf", "long")
+        self.add("b-ok.elf")
+        (self.inputs / "c-invalid.elf").write_bytes(b"bad")
+        result = self.invoke("--jobs", "2", "--timeout", "2")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        starts = [line.split(" ", 2)[:2] for line in result.stdout.splitlines() if line.startswith("start ")]
+        self.assertEqual(starts, [["start", f"[{i}/3]"] for i in range(1, 4)])
+        finishes = [line.split(" ", 3)[:3] for line in result.stdout.splitlines() if line.startswith("finish ")]
+        self.assertEqual(finishes, [["finish", "[1/3]", "b-ok.elf"],
+                                    ["finish", "[2/3]", "c-invalid.elf"],
+                                    ["finish", "[3/3]", "a-long.elf"]])
+
     def test_preflight_rejects_threads_and_oversubscription_without_db(self):
         self.add("one.elf")
         result = self.invoke("--jobs", "5")
@@ -323,6 +336,7 @@ class BatchIntegrationTests(unittest.TestCase):
         process.wait(timeout=5)
         result = self.invoke(resume=True)
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("finish [1/1] one.elf", result.stdout)
         row = self.connection().execute("SELECT * FROM job_results").fetchone()
         self.assertEqual(row["attempt_count"], 1)
         self.assertEqual(row["status"], "succeeded")
@@ -354,6 +368,9 @@ class BatchIntegrationTests(unittest.TestCase):
         original.unlink()
         result = self.invoke(resume=True)
         self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("finish [1/2] b-long.elf", result.stdout)
+        self.assertIn("start [2/2] b-long.elf", result.stdout)
+        self.assertIn("finish [2/2] b-long.elf", result.stdout)
         db = self.connection()
         attempts = db.execute("SELECT job_id,attempt_no,status FROM attempts ORDER BY attempt_id").fetchall()
         self.assertEqual([tuple(r) for r in attempts], [(1, 1, "succeeded"), (2, 1, "interrupted"), (2, 2, "timeout")])
@@ -375,6 +392,7 @@ class BatchIntegrationTests(unittest.TestCase):
         process.send_signal(signal.SIGINT)
         out, err = process.communicate(timeout=10)
         self.assertEqual(process.returncode, 130, err)
+        self.assertIn("finish [0/1] long.elf", out)
         self.assertIn("status=interrupted", out)
         self.assertEqual(self.connection().execute("SELECT status FROM run").fetchone()[0], "interrupted")
 

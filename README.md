@@ -68,15 +68,19 @@ and completion convention (XiangShan GOOD TRAP vs Saturn's HTIF/test harness).
 The runner does not compile, instrument or make one target's ELF compatible with
 another. Both current XiangShan pins and Saturn accept ELF directly.
 
-Progress is printed one line at a time; numbers identify jobs, not completion order:
+Progress is printed one line at a time. `start` counts jobs started and `finish`
+counts jobs completed, independently of job IDs and completion order:
 
 ```text
 start [3/20] kernels/matmul.elf
-finish [3/20] kernels/matmul.elf total_cycle=145678 kernel_cycle=123456 status=succeeded
+finish [1/20] kernels/matmul.elf total_cycle=145678 kernel_cycle=123456 status=succeeded
 ```
 
-`finish` is printed after the results are committed. Multiple kernel samples are
-shown as `kernel_cycle=multiple(N)`; missing samples as `kernel_cycle=null`.
+`finish` is printed after the results are committed. Completed jobs include failures,
+timeouts, and invalid inputs; interrupted jobs awaiting retry do not advance the
+completion count. On resume, both counters include previously completed jobs.
+Multiple kernel samples are shown as `kernel_cycle=multiple(N)`; missing samples
+as `kernel_cycle=null`.
 
 ## Cycle contract
 
