@@ -36,7 +36,7 @@ RUN git clone --depth 1 --branch "v${VERILATOR_VERSION}" https://github.com/veri
     && ./configure CC=clang-18 CXX=clang++-18 LINK=clang++-18 \
     && jobs=$(build-jobs verilator) && make -j"$jobs" && make install \
     && mkdir -p /toolchain-notices/usr/share/rvv-simulator/licenses/verilator \
-    && cp COPYING* /toolchain-notices/usr/share/rvv-simulator/licenses/verilator/ \
+    && cp -a LICENSE* /toolchain-notices/usr/share/rvv-simulator/licenses/verilator/ \
     && verilator --version > /toolchain-notices/usr/share/rvv-simulator/verilator.txt \
     && rm -rf /tmp/verilator
 
