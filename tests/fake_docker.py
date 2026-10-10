@@ -71,6 +71,8 @@ def simulation(name):
                 stdout.write("RVV_KERNEL name=bad cycles=-1\n")
             if "long" in scenario:
                 time.sleep(30)
+            elif "slow" in scenario:
+                time.sleep(1)
             else:
                 time.sleep(0.25)
             if "cycle-limit" in scenario:

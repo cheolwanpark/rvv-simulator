@@ -135,6 +135,8 @@ class BackendTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             arguments("resume", {"DB": "x", "WAVE": "1"})
         self.assertEqual(arguments("resume", {"DB": "x"}), ["resume", "x"])
+        self.assertEqual(arguments("resume", {"DB": "x", "JOBS": "2", "TIMEOUT": "7200"}),
+                         ["resume", "x", "--jobs", "2", "--timeout", "7200"])
 
 
 class TimestampTests(unittest.TestCase):
@@ -301,6 +303,51 @@ class BatchIntegrationTests(unittest.TestCase):
                              original_logs)
             self.assertEqual(len([c for c in self.calls() if c[0] == "create"]), attempt_count + 1)
 
+    def test_resume_timeout_override_applies_and_persists(self):
+        self.add("a-ok.elf", "slow")
+        self.add("b-fail.elf", "slow-fail")
+        result = self.invoke("--timeout", "0.4")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        db = self.connection()
+        self.assertEqual([r[0] for r in db.execute("SELECT status FROM job_results ORDER BY job_id")],
+                         ["timeout", "timeout"])
+        original_attempts = db.execute("SELECT * FROM attempts ORDER BY attempt_id").fetchall()
+
+        rejected = self.invoke("--jobs", "5", "--timeout", "5", resume=True)
+        self.assertEqual(rejected.returncode, 2, rejected.stderr)
+        self.assertEqual(db.execute("SELECT timeout FROM run").fetchone()[0], 0.4)
+
+        resumed = self.invoke("--timeout", "5", resume=True)
+        self.assertEqual(resumed.returncode, 1, resumed.stderr)
+        self.assertEqual(db.execute("SELECT timeout FROM run").fetchone()[0], 5)
+        self.assertEqual([r[0] for r in db.execute("SELECT status FROM job_results ORDER BY job_id")],
+                         ["succeeded", "failed"])
+        event = db.execute("SELECT message FROM events WHERE kind='resume' ORDER BY event_id DESC LIMIT 1").fetchone()[0]
+        self.assertIn("timeout=5.0; previous_timeout=0.4", event)
+
+        inherited = self.invoke(resume=True)
+        self.assertEqual(inherited.returncode, 1, inherited.stderr)
+        self.assertEqual(db.execute("SELECT timeout FROM run").fetchone()[0], 5)
+        self.assertEqual([tuple(r) for r in db.execute("SELECT status,attempt_count FROM job_results ORDER BY job_id")],
+                         [("succeeded", 2), ("failed", 3)])
+        self.assertEqual(db.execute("SELECT * FROM attempts WHERE attempt_no=1 ORDER BY attempt_id").fetchall(),
+                         original_attempts)
+
+    def test_resume_rejects_invalid_timeout_without_changes(self):
+        self.add("one.elf")
+        result = self.invoke()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        db = self.connection()
+        original_run = db.execute("SELECT * FROM run").fetchone()
+        original_calls = self.calls()
+        for value in ("0", "-1", "nan", "inf", "invalid"):
+            with self.subTest(timeout=value):
+                rejected = self.invoke("--timeout", value, resume=True)
+                self.assertEqual(rejected.returncode, 2, rejected.stderr)
+                self.assertIn("positive seconds", rejected.stderr)
+                self.assertEqual(db.execute("SELECT * FROM run").fetchone(), original_run)
+                self.assertEqual(self.calls(), original_calls)
+
     def test_resume_retries_cycle_limit(self):
         self.add("limit.elf", "cycle-limit")
         result = self.invoke()
@@ -455,6 +502,10 @@ class BatchIntegrationTests(unittest.TestCase):
                                  f"DOCKER={self.docker}", "WAVE=0"], cwd=ROOT, env=self.env, capture_output=True, text=True, timeout=15)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.connection().execute("SELECT wave FROM run").fetchone()[0], 0)
+        resumed = subprocess.run(["make", "resume", f"DB={self.database}", f"DOCKER={self.docker}", "TIMEOUT=7200"],
+                                 cwd=ROOT, env=self.env, capture_output=True, text=True, timeout=15)
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assertEqual(self.connection().execute("SELECT timeout FROM run").fetchone()[0], 7200)
 
 
 class StoreTests(unittest.TestCase):

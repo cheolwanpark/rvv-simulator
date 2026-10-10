@@ -30,9 +30,10 @@ def arguments(target, env):
             args.append("--wave")
     elif target == "resume":
         args = ["resume", required("DB")]
-        if env.get("JOBS"):
-            args += ["--jobs", env["JOBS"]]
-        for name in ("ELF_DIR", "BACKEND", "SEED", "MAX_CYCLES", "TIMEOUT", "IMAGE", "CPU_SET", "MEMORY", "WAVE"):
+        for name, flag in (("JOBS", "--jobs"), ("TIMEOUT", "--timeout")):
+            if env.get(name):
+                args += [flag, env[name]]
+        for name in ("ELF_DIR", "BACKEND", "SEED", "MAX_CYCLES", "IMAGE", "CPU_SET", "MEMORY", "WAVE"):
             if env.get(name):
                 raise ValueError(f"{name} cannot change during resume; settings come from SQLite")
     else:

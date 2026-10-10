@@ -56,6 +56,7 @@ def parser():
     resume = commands.add_parser("resume", help="retry all jobs that have not succeeded in the same SQLite file")
     resume.add_argument("database", type=Path)
     resume.add_argument("--jobs", type=positive, help="override previous scheduler concurrency")
+    resume.add_argument("--timeout", type=seconds, help="override and save the per-attempt wall timeout in seconds")
     resume.add_argument("--docker", default=os.environ.get("DOCKER", "docker"), help="Docker executable")
     return root
 
@@ -105,8 +106,11 @@ def run(args, docker=None):
                 image_id, cpus, _ = docker.preflight(config["image_id"], config["backend"], jobs, config["cpu_set"])
                 if image_id != config["image_id"]:
                     raise ValueError("resume requires the original immutable image ID")
+                timeout = args.timeout if args.timeout is not None else config["timeout"]
                 with store.db:
-                    store.event("resume", f"jobs={jobs}")
+                    if args.timeout is not None:
+                        store.db.execute("UPDATE run SET timeout=?,updated_at=?", (timeout, now()))
+                    store.event("resume", f"jobs={jobs}; timeout={timeout}; previous_timeout={config['timeout']}")
             result = Runner(store, docker, cpus, jobs).execute()
         finally:
             if store is not None:
