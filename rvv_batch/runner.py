@@ -81,8 +81,7 @@ class Runner:
         self.stop_signal = None
         self.total = self.db.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
         self.finished = self.db.execute(
-            "SELECT COUNT(*) FROM job_results WHERE status NOT IN "
-            "('pending','starting','running','stopping','interrupted')"
+            "SELECT COUNT(*) FROM job_results WHERE status='succeeded'"
         ).fetchone()[0]
         self.started = self.finished
 
@@ -128,7 +127,7 @@ class Runner:
                     (attempt_id, "wave" if path.name == "wave.fst" else "auxiliary",
                      path.relative_to(destination).as_posix(), digest.hexdigest(), path.stat().st_size, relative))
 
-    def finalize(self, attempt_id, state, forced_status=None, reason=None):
+    def finalize(self, attempt_id, state, forced_status=None, reason=None, *, recovering=False):
         self.ingest(attempt_id, final=True)
         parsed = parse_lines(self.config["backend"], self.store.lines(attempt_id))
         exit_code = state.get("ExitCode")
@@ -187,7 +186,8 @@ class Runner:
         kernel_text = str(kernels[0]) if len(kernels) == 1 else f"multiple({len(kernels)})" if kernels else "null"
         # Escape control characters without obscuring ordinary spaces and Unicode names.
         name = json.dumps(name, ensure_ascii=False)[1:-1]
-        if status != "interrupted":
+        # Recovered failures still await a retry in this invocation.
+        if status == "succeeded" or (not recovering and status != "interrupted"):
             self.finished += 1
         self.output(f"finish [{self.finished}/{self.total}] {name} "
                     f"total_cycle={total_cycle if total_cycle is not None else 'null'} "
@@ -219,7 +219,8 @@ class Runner:
                 finished = name in states and state.get("Status") == "exited" and not states[name].get("Running")
                 was_running = name in previously_running
                 forced = None if finished and not was_running and row["status"] != "stopping" else "interrupted"
-                self.finalize(row["attempt_id"], state, forced, "controller interrupted" if forced else None)
+                self.finalize(row["attempt_id"], state, forced, "controller interrupted" if forced else None,
+                              recovering=True)
             if name in names:
                 self.cleanup(row["attempt_id"], name)
             elif row["status"] not in ("starting", "running", "stopping") or self.work(row["attempt_id"]).exists():
@@ -263,8 +264,9 @@ class Runner:
         try:
             self.recover()
             self.started = self.finished
+            # Snapshot the queue once: each unsuccessful job gets one new attempt.
             pending = self.db.execute(
-                "SELECT j.* FROM jobs j JOIN job_results r USING(job_id) WHERE r.status IN ('pending','interrupted') ORDER BY j.job_id"
+                "SELECT j.* FROM jobs j JOIN job_results r USING(job_id) WHERE r.status != 'succeeded' ORDER BY j.job_id"
             ).fetchall()
             with self.db:
                 self.db.execute("UPDATE run SET status='running',jobs=?,updated_at=?", (self.jobs, now()))

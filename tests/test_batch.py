@@ -231,10 +231,13 @@ class BatchIntegrationTests(unittest.TestCase):
         db.close()
         resumed = self.invoke("--jobs", "1", resume=True)
         self.assertEqual(resumed.returncode, 1, resumed.stderr)
+        self.assertIn("start [4/4] failed.elf", resumed.stdout)
+        self.assertIn("finish [4/4] failed.elf", resumed.stdout)
         db = self.connection()
         self.assertEqual(db.execute("SELECT id FROM run").fetchone()[0], before)
-        self.assertEqual(db.execute("SELECT COUNT(*) FROM attempts").fetchone()[0], 4)
-        self.assertEqual(len([c for c in self.calls() if c[0] == "create"]), 4)
+        self.assertEqual([r[0] for r in db.execute("SELECT attempt_count FROM job_results ORDER BY job_id")],
+                         [1, 1, 2, 1])
+        self.assertEqual(len([c for c in self.calls() if c[0] == "create"]), 5)
         overwrite = self.invoke()
         self.assertEqual(overwrite.returncode, 2)
         self.assertIn("already exists", overwrite.stderr)
@@ -248,6 +251,11 @@ class BatchIntegrationTests(unittest.TestCase):
         self.assertIsNone(wave["data"])
         self.assertEqual((self.database.parent / wave["relative_path"]).read_bytes(), b"fixture FST\x00\xff")
         self.assertEqual(db.execute("SELECT total_cycle FROM job_results").fetchone()[0], 456)
+        resumed = self.invoke(resume=True)
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assertNotIn("start [", resumed.stdout)
+        self.assertEqual(db.execute("SELECT COUNT(*) FROM attempts").fetchone()[0], 1)
+        self.assertEqual(len([c for c in self.calls() if c[0] == "create"]), 1)
 
     def test_loop_benchmark_json_is_stored_and_invalid_is_reported(self):
         self.add("a-loop.elf", "loop-json")
@@ -266,15 +274,44 @@ class BatchIntegrationTests(unittest.TestCase):
         self.assertEqual(db.execute("SELECT parser_version FROM run").fetchone()[0], PARSER_VERSION)
         self.assertEqual(db.execute("SELECT COUNT(*) FROM events WHERE kind='measurement_error'").fetchone()[0], 1)
 
-    def test_timeout_and_invalid_elf_continue(self):
+    def test_resume_retries_timeout_and_invalid_input_once_per_invocation(self):
         self.add("a-long.elf", "long")
         self.add("b-ok.elf")
         (self.inputs / "c-invalid.elf").write_bytes(b"bad")
         result = self.invoke("--timeout", "0.4")
         self.assertEqual(result.returncode, 1, result.stderr)
-        rows = self.connection().execute("SELECT * FROM job_results ORDER BY job_id").fetchall()
+        db = self.connection()
+        rows = db.execute("SELECT * FROM job_results ORDER BY job_id").fetchall()
         self.assertEqual([r["status"] for r in rows], ["timeout", "succeeded", "invalid_input"])
         self.assertEqual(rows[0]["kernel_cycle"], 123)
+        original_attempts = db.execute("SELECT * FROM attempts ORDER BY attempt_id").fetchall()
+        original_logs = db.execute("SELECT * FROM logs ORDER BY attempt_id,stream,sequence").fetchall()
+        for attempt_count in (2, 3):
+            resumed = self.invoke(resume=True)
+            self.assertEqual(resumed.returncode, 1, resumed.stderr)
+            self.assertIn("start [2/3] a-long.elf", resumed.stdout)
+            self.assertIn("finish [2/3] a-long.elf", resumed.stdout)
+            self.assertIn("finish [3/3] c-invalid.elf", resumed.stdout)
+            rows = db.execute("SELECT * FROM job_results ORDER BY job_id").fetchall()
+            self.assertEqual([r["status"] for r in rows], ["timeout", "succeeded", "invalid_input"])
+            self.assertEqual([r["attempt_count"] for r in rows], [attempt_count, 1, attempt_count])
+            self.assertEqual(db.execute("SELECT * FROM attempts WHERE attempt_no=1 ORDER BY attempt_id").fetchall(),
+                             original_attempts)
+            self.assertEqual(db.execute("SELECT * FROM logs WHERE attempt_id<=3 ORDER BY attempt_id,stream,sequence").fetchall(),
+                             original_logs)
+            self.assertEqual(len([c for c in self.calls() if c[0] == "create"]), attempt_count + 1)
+
+    def test_resume_retries_cycle_limit(self):
+        self.add("limit.elf", "cycle-limit")
+        result = self.invoke()
+        self.assertEqual(result.returncode, 1, result.stderr)
+        db = self.connection()
+        self.assertEqual(db.execute("SELECT status FROM job_results").fetchone()[0], "cycle_limit")
+        resumed = self.invoke(resume=True)
+        self.assertEqual(resumed.returncode, 1, resumed.stderr)
+        self.assertIn("finish [1/1] limit.elf", resumed.stdout)
+        self.assertEqual([tuple(r) for r in db.execute("SELECT attempt_no,status FROM attempts ORDER BY attempt_no")],
+                         [(1, "cycle_limit"), (2, "cycle_limit")])
 
     def test_progress_counts_completions_independently_of_job_ids(self):
         self.add("a-long.elf", "long")
@@ -316,9 +353,13 @@ class BatchIntegrationTests(unittest.TestCase):
         self.assertIsNone(rows[2]["total_cycle"])
         self.assertEqual(rows[3]["status"], "failed")
         self.assertEqual(rows[3]["measurement_status"], "partial")
+        resumed = self.invoke(resume=True)
+        self.assertEqual(resumed.returncode, 1, resumed.stderr)
+        rows = self.connection().execute("SELECT attempt_count FROM job_results ORDER BY job_id").fetchall()
+        self.assertEqual([r[0] for r in rows], [1, 1, 1, 2])
 
-    def test_resume_finalizes_already_exited_simulator_without_rerun(self):
-        self.add("one.elf")
+    def resume_exited_simulator(self, scenario):
+        self.add("one.elf", scenario)
         env = dict(self.env, RVV_FAKE_INSPECT_DELAY="2")
         process = subprocess.Popen(self.argv(), cwd=ROOT, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         self.addCleanup(lambda: process.kill() if process.poll() is None else None)
@@ -334,7 +375,10 @@ class BatchIntegrationTests(unittest.TestCase):
         finished_at = json.loads(files[0].read_text())["State"]["FinishedAt"]
         process.kill()
         process.wait(timeout=5)
-        result = self.invoke(resume=True)
+        return self.invoke(resume=True), finished_at
+
+    def test_resume_finalizes_already_exited_simulator_without_rerun(self):
+        result, finished_at = self.resume_exited_simulator("ok")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("finish [1/1] one.elf", result.stdout)
         row = self.connection().execute("SELECT * FROM job_results").fetchone()
@@ -342,6 +386,15 @@ class BatchIntegrationTests(unittest.TestCase):
         self.assertEqual(row["status"], "succeeded")
         self.assertEqual(row["total_cycle"], 456)
         self.assertEqual(row["finished_at"], finished_at[:23] + "+00:00")
+
+    def test_resume_retries_recovered_failure_without_double_counting(self):
+        result, _ = self.resume_exited_simulator("fail")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        progress = [line.split(" ", 2)[:2] for line in result.stdout.splitlines()
+                    if line.startswith(("start ", "finish "))]
+        self.assertEqual(progress, [["finish", "[0/1]"], ["start", "[1/1]"], ["finish", "[1/1]"]])
+        rows = self.connection().execute("SELECT attempt_no,status FROM attempts ORDER BY attempt_no").fetchall()
+        self.assertEqual([tuple(r) for r in rows], [(1, "failed"), (2, "failed")])
 
     def test_killed_controller_recovers_live_container_and_preserves_input(self):
         self.add("a-ok.elf")

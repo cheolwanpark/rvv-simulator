@@ -73,7 +73,9 @@ def simulation(name):
                 time.sleep(30)
             else:
                 time.sleep(0.25)
-            if "fail" in scenario:
+            if "cycle-limit" in scenario:
+                stderr.write("EXCEEDING CYCLE/INSTR LIMIT\n")
+            elif "fail" in scenario:
                 stderr.write("HIT BAD TRAP at pc = 0x80000000\n*** FAILED *** code=1\n")
             else:
                 if "saturn" in item["Image"]:

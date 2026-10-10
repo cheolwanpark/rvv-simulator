@@ -53,7 +53,7 @@ def parser():
     run.add_argument("--cpu-set", help="Docker CPU IDs to allocate, e.g. 0-7 or 0,2,4,6")
     run.add_argument("--memory", help="per-container Docker memory limit, e.g. 8g (unset by default)")
     run.add_argument("--docker", default=os.environ.get("DOCKER", "docker"), help="Docker executable")
-    resume = commands.add_parser("resume", help="resume pending/interrupted jobs in the same SQLite file")
+    resume = commands.add_parser("resume", help="retry all jobs that have not succeeded in the same SQLite file")
     resume.add_argument("database", type=Path)
     resume.add_argument("--jobs", type=positive, help="override previous scheduler concurrency")
     resume.add_argument("--docker", default=os.environ.get("DOCKER", "docker"), help="Docker executable")

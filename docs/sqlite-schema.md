@@ -109,14 +109,17 @@ Attempt statuses:
 | `starting`, `running`, `stopping` | nonterminal attempt, possibly from a dead controller | recover outputs and container state first |
 | `interrupted` | explicitly interrupted or unfinished when recovered | create another attempt |
 | `succeeded` | exit 0 and backend success marker, no failure marker | retain |
-| `failed` | nonzero exit, missing success marker, OOM, or missing requested waveform | retain |
-| `timeout` | per-attempt wall limit | retain |
-| `cycle_limit` | simulator-reported cycle/instruction limit | retain |
-| `invalid_input` | rejected ELF | retain |
+| `failed` | nonzero exit, missing success marker, OOM, or missing requested waveform | create another attempt |
+| `timeout` | per-attempt wall limit | create another attempt |
+| `cycle_limit` | simulator-reported cycle/instruction limit | create another attempt |
+| `invalid_input` | rejected ELF | create another rejected attempt without launching a simulator |
 
 A job with no attempt appears as `pending` in the view and will be scheduled.
-Terminal failures are not retried automatically. A new request is required to
-change the input or simulator settings.
+After recovery, every job whose latest status is not `succeeded` is scheduled
+once per resume invocation. Failures during that invocation await the next resume;
+all previous attempts and their outputs are retained. Successful jobs are skipped
+regardless of measurement status. A new request is required to change the input
+or simulator settings, including the timeout.
 
 `measurement_status`: `pending`, `complete`, `missing_kernel`, `missing_total`,
 `invalid` or `partial`. `kernel_status`: `pending`, `available`, `missing` or

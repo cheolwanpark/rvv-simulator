@@ -78,7 +78,8 @@ finish [1/20] kernels/matmul.elf total_cycle=145678 kernel_cycle=123456 status=s
 
 `finish` is printed after the results are committed. Completed jobs include failures,
 timeouts, and invalid inputs; interrupted jobs awaiting retry do not advance the
-completion count. On resume, both counters include previously completed jobs.
+completion count. On resume, both counters start with previously succeeded jobs;
+other jobs count as they are retried and completed in that invocation.
 Multiple kernel samples are shown as `kernel_cycle=multiple(N)`; missing samples
 as `kernel_cycle=null`.
 
@@ -221,10 +222,16 @@ may leave containers running; resume identifies them by request labels and stops
 them before retrying.
 
 Resume keeps the same request ID, ELF snapshots, image ID and settings. It retains
-all attempt history and executes only `pending` or `interrupted` jobs. Failed,
-invalid-input, cycle-limited and timed-out jobs are terminal; create a new request
-to retry them with different settings. A simulator that exited before the
-controller died is finalized from its existing outputs instead of being rerun.
+all attempt history and executes every job whose latest status is not `succeeded`,
+including `pending`, `interrupted`, `failed`, `timeout`, `cycle_limit`, and
+`invalid_input`. Each job gets at most one new attempt per resume invocation;
+another failure is not retried again until the next resume. Invalid inputs are
+rejected again from the stored validation result without launching a simulator.
+Successful jobs are retained even if their measurements are missing or invalid.
+Create a new request to change the inputs or simulator settings, including the
+timeout. A simulator that exited before the controller died is finalized from
+its existing outputs first; it is rerun only if the recovered status is not
+`succeeded`.
 
 During execution, `<DB>.work/`, `<DB>-wal` and `<DB>-shm` can exist. Keep them for
 recovery after an unclean exit; they are not additional result databases. Successful
