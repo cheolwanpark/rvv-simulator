@@ -16,8 +16,12 @@ def arguments(target, env):
             raise ValueError(f"{name} is required for make {target}")
         return value
 
-    if target == "run":
-        args = ["run", required("ELF_DIR"), "--backend", required("BACKEND"), "--output", required("DB")]
+    if target in ("run", "run-single"):
+        single = target == "run-single"
+        if single and env.get("JOBS"):
+            raise ValueError("JOBS is not supported for make run-single")
+        args = [target, required("ELF" if single else "ELF_DIR"), "--backend", required("BACKEND"),
+                "--output", required("ARTIFACT" if single else "DB")]
         for name, flag in (("JOBS", "--jobs"), ("SEED", "--seed"), ("MAX_CYCLES", "--max-cycles"),
                            ("TIMEOUT", "--timeout"), ("IMAGE", "--image"), ("CPU_SET", "--cpu-set"),
                            ("MEMORY", "--memory")):
@@ -33,7 +37,7 @@ def arguments(target, env):
         for name, flag in (("JOBS", "--jobs"), ("TIMEOUT", "--timeout"), ("MAX_CYCLES", "--max-cycles")):
             if env.get(name):
                 args += [flag, env[name]]
-        for name in ("ELF_DIR", "BACKEND", "SEED", "IMAGE", "CPU_SET", "MEMORY", "WAVE"):
+        for name in ("ELF", "ARTIFACT", "ELF_DIR", "BACKEND", "SEED", "IMAGE", "CPU_SET", "MEMORY", "WAVE"):
             if env.get(name):
                 raise ValueError(f"{name} cannot change during resume; settings come from SQLite")
     else:

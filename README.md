@@ -1,17 +1,65 @@
-# RVV simulator batches
+# RVV simulator runner
 
-Run a directory of prebuilt RV64 bare-metal ELF files on XiangShan v2/v3 or
-Saturn. Each request creates **one ordinary SQLite database** containing the
-inputs, logs, settings, measurements and execution history. Resume updates that
-same database. Analysis needs only SQLite; there is no extraction command,
-compressed payload, custom SQL function or Python package required to read it.
+Run prebuilt RV64 bare-metal ELF files on XiangShan v2/v3 or Saturn.
+`run-single` executes one ELF and produces a portable ZIP containing its input,
+logs, measurements, settings and simulator files. `run` and `resume` use the same
+executor to schedule batches and save results in **one ordinary SQLite database**.
+Batch analysis needs only SQLite; waveforms and auxiliary files live alongside it.
 
 Requires Python 3.10+, a POSIX host (Linux or macOS), and a Linux Docker daemon
 with the runtime images already built. Images target `linux/amd64`; Docker Desktop
 on Apple Silicon can run them through emulation. Bind mounts must refer to the
 runner's filesystem, as with local Docker or Docker Desktop.
 
-## Run
+## Run one ELF
+
+```sh
+make build BACKEND=saturn
+make run-single ELF=./program.elf BACKEND=saturn ARTIFACT=./results/program.zip
+
+# Equivalent script and CLI entry points:
+./run-single ./program.elf --backend saturn --output ./results/program.zip
+./rvv-batch run-single ./program.elf --backend saturn --output ./results/program.zip
+```
+
+Use a different output path for each invocation: existing outputs and work
+directories are never overwritten. `ELF`, `BACKEND` and `ARTIFACT` are required
+for Make. Single execution accepts the simulation options in the table below,
+except `JOBS`; it selects the first available CPU in `CPU_SET` (or Docker's set).
+
+The command prints a cycle summary and the artifact path:
+
+```text
+total_cycle=145678 kernel_cycle=123456 status=succeeded
+artifact /path/to/results/program.zip
+```
+
+ZIP artifact format **1** contains:
+
+```text
+result.json
+input/program.elf
+manifests/*
+output/stdout.log
+output/stderr.log
+output/<waveform and other simulator files>
+```
+
+`result.json` records parser/tool versions, execution identity, input hash,
+effective settings and immutable image ID, command, timestamps, status/reason,
+cycle summary, every measurement, categorized parsing errors, and file hashes
+and sizes. Measurements retain their source stream and line. Raw files keep their
+original bytes. ZIP64 supports large files; FST files are stored without further
+compression. Any ordinary ZIP reader can inspect the artifact.
+
+Failures, invalid ELFs, timeouts and graceful interruptions also produce artifacts.
+Setup/controller errors retain available staging under `<ARTIFACT>.work/` for
+inspection; no incomplete ZIP is published. There is no standalone resume command.
+A hard kill can leave a container running; its name is `rvv-<request-id>-1`, with
+`rvv.batch.run` and `rvv.batch.attempt` labels. Stop/remove that container before
+manually clearing its work directory or choose a new output path.
+
+## Run a batch
 
 ```sh
 # Prepare the desired image separately; run never builds or pulls an image.
@@ -159,9 +207,10 @@ does not subtract overhead or infer a warmup policy.
 ## Analyze the SQLite file
 
 See [the schema contract](docs/sqlite-schema.md) for columns, statuses and recovery
-semantics. `PRAGMA user_version` and `run.schema_version` are both `1`.
-The output parser version is `2`; databases created with parser version `1`
-require the original tool version for resume. Existing results are not reparsed.
+semantics. `PRAGMA user_version` and `run.schema_version` are both `2`.
+The output parser version remains `2`. Schema v1 databases remain readable with
+SQLite but must be resumed with the original tool version; there is no migration.
+Resume rejects incompatible versions before changing the database.
 
 ```sh
 sqlite3 -header -column results/experiment.sqlite \
@@ -205,8 +254,10 @@ Saturn selects its normal executable by default and its FST executable only with
 wave enabled. XiangShan's trace-capable executable gets no wave-dump flags by
 default. A successful wave-enabled job must produce a nonempty `wave.fst`.
 
-ELFs, stdout/stderr, image/source manifests, command arguments, settings and every
-recognized cycle sample always go into SQLite, without compression. FST and any
+For batch attempts finalized by the executor, ELFs, stdout/stderr, image/source
+manifests, command arguments, settings and every recognized cycle sample go into
+SQLite, without compression. Logs become queryable when the attempt finishes;
+during execution, inspect `<DB>.work/<attempt-id>/output/*.log`. FST and any
 other simulator-created files always stay as original files under:
 
 ```text
@@ -214,39 +265,40 @@ experiment.sqlite.artifacts/<job-id>/attempt-<n>/
 ```
 
 SQLite indexes their relative paths, sizes and SHA-256 hashes. Storage location is
-selected by artifact type, never by file size. There are no extra archives or an
-`extract` step. Copy the SQLite file alone for input/log/metric analysis; copy its
+selected by artifact type, never by file size. Batch jobs do not create intermediate
+ZIPs or require an `extract` step. Copy the SQLite file alone for input/log/metric analysis; copy its
 `.artifacts` directory alongside it when you also need the waveforms.
 
 ## Interruption and resume
 
-The scheduler is the sole SQLite writer. Detached containers write into isolated
-host directories while the scheduler regularly commits their logs. A lock prevents
-two runners from updating the same DB. On Ctrl-C/SIGTERM the runner stops its
-containers, saves partial outputs and exits with 130/143. A hard controller kill
-may leave containers running; resume identifies them by request labels and stops
-them before retrying.
+The scheduler is the sole SQLite writer. Each worker runs the shared single-ELF
+executor in an isolated directory. A lock prevents two schedulers from updating
+the same DB. On Ctrl-C/SIGTERM, scheduling stops, active containers are stopped,
+partial results are finalized and imported, and the command exits with 130/143.
 
-Resume keeps the same request ID, ELF snapshots, image ID and simulator settings,
-while allowing concurrency, the wall timeout and cycle limit to change. It retains
-all attempt history and executes every job whose latest status is not `succeeded`,
-including `pending`, `interrupted`, `failed`, `timeout`, `cycle_limit`, and
-`invalid_input`. Each job gets at most one new attempt per resume invocation;
-another failure is not retried again until the next resume. Invalid inputs are
-rejected again from the stored validation result without launching a simulator.
-Successful jobs are retained even if their measurements are missing or invalid.
-Use `--timeout` (Make: `TIMEOUT`) or `--max-cycles` (Make: `MAX_CYCLES`) to change
-the wall timeout or simulator cycle limit for new attempts;
-previous attempt results remain unchanged. Create a new request to change the
-inputs or other simulator settings. A simulator that exited before the controller
-died is finalized from its existing outputs first; it is rerun only if the
-recovered status is not `succeeded`.
+Resume keeps the request ID, ELF snapshots, image ID and simulator settings while
+allowing concurrency, wall timeout and cycle limit overrides. After recovery, it
+executes each job whose latest status is not `succeeded` once per invocation.
+Failures await another resume; successful jobs are retained even when their
+measurements are missing or invalid. Invalid ELFs are validated again from their
+stored bytes without launching a simulator. Previous attempt settings and results
+remain unchanged.
 
-During execution, `<DB>.work/`, `<DB>-wal` and `<DB>-shm` can exist. Keep them for
-recovery after an unclean exit; they are not additional result databases. Successful
-shutdown checkpoints WAL into the main SQLite file and removes staged work files.
-Copy the database after shutdown. Close concurrent SQL readers if they prevent the
-final checkpoint. The empty `<DB>.lock` inode is retained for safe locking.
+Recovery stops/removes leftover containers carrying the request label, then imports
+any valid completed result directories. `result.json` is the completion marker,
+published atomically after execution, parsing and file inventory finish. Attempts
+without a valid marker become `interrupted` and are retried, even if their container
+exited before the controller died. Their partial files stay in `.work` for debugging;
+they are not parsed or imported into SQLite. Completed result directories are
+removed after import commits. External files are copied before the transaction;
+source files remain available until commit, so an interrupted import can be repeated.
+
+Keep `<DB>.work/`, `<DB>-wal` and `<DB>-shm` after an unclean exit for recovery.
+Clean shutdown checkpoints WAL into the main SQLite file. Copy the database after
+shutdown, and copy `.artifacts` alongside it when waveforms are needed. Close
+concurrent SQL readers if they prevent checkpointing. Incomplete debug directories
+may remain after a successful resume; remove them manually when no longer needed.
+The empty `<DB>.lock` inode is retained for safe locking.
 
 CLI exit codes: `0` for completed jobs (missing kernel markers are allowed), `1` for
 job failures or invalid/missing total measurements, `2` for setup/controller errors,
@@ -261,11 +313,21 @@ make smoke BACKEND=xiangshan-v3   # Existing image smoke checks
 make smoke BACKEND=saturn
 ```
 
-The local tests exercise the real CLI against a process-level Docker double,
-including parallel execution, forced controller death, resumed attempts, SIGINT,
-plain SQLite queries, waveform retention and Make argument forwarding. They do
-not establish that a particular ELF runs correctly on real RTL. After building an
-image, also run a small batch of target-specific ELFs with and without `WAVE=1` and
-compare the database counters with the retained simulator logs.
+Most coverage is unit testing: parsing/classification, execution lifecycle,
+transactional result import, byte preservation, scheduling and recovery. Three
+process-level tests cover standalone ZIP/Make execution, parallel batch/resume,
+and SIGINT using a Docker double. Image/helper fixture tests remain fast and do
+not require Docker. Tests do not establish that an ELF runs correctly on real RTL;
+after building an image, run its smoke check and a target-specific ELF with and
+without waveforms.
+
+## Implementation
+
+- `runner.py` executes one staged ELF; it has no SQLite dependency.
+- `artifacts.py` defines completed results, log readers, and ZIP publication.
+- `orchestrator.py` schedules bounded worker threads and coordinates recovery.
+- `store.py` owns all SQL and result import; workers never access the connection.
+- `backends.py` owns ELF checks, simulator arguments and output parsing.
+- CLI/Make entry points share option validation and call these implementations.
 
 Image recipes and source pins are documented in [docker/README.md](docker/README.md).

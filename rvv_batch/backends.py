@@ -5,6 +5,7 @@ import json
 import math
 import re
 import struct
+from typing import NamedTuple
 
 BACKENDS = ("xiangshan-v2", "xiangshan-v3", "saturn")
 PARSER_VERSION = 2
@@ -64,6 +65,22 @@ def validate_elf(data):
         raise ValueError("overlapping ELF load segments")
 
 
+class Measurement(NamedTuple):
+    metric: str
+    scope: str
+    name: str
+    value: int | float
+    source_stream: str
+    source_line: int
+    source: str
+
+
+@dataclass
+class ParseError:
+    category: str
+    message: str
+
+
 @dataclass
 class Parsed:
     measurements: list = field(default_factory=list)
@@ -72,14 +89,17 @@ class Parsed:
     limit: bool = False
     errors: list = field(default_factory=list)
 
+    def error(self, category, message):
+        self.errors.append(ParseError(category, message))
+
     def add(self, metric, name, value, stream, line_no, source, scope="simulation"):
         if isinstance(value, int) and not 0 <= value <= MAX_INTEGER:
-            self.errors.append(f"{stream}:{line_no}: {metric} outside SQLite INTEGER range")
+            self.error(metric, f"{stream}:{line_no}: {metric} outside INTEGER range")
             return
         if isinstance(value, float) and not math.isfinite(value):
-            self.errors.append(f"{stream}:{line_no}: non-finite {metric}")
+            self.error(metric, f"{stream}:{line_no}: non-finite {metric}")
             return
-        self.measurements.append((metric, scope, name, value, stream, line_no, source))
+        self.measurements.append(Measurement(metric, scope, name, value, stream, line_no, source))
 
 
 def parse_loop_benchmark(text, result, stream, line_no):
@@ -89,7 +109,7 @@ def parse_loop_benchmark(text, result, stream, line_no):
     try:
         record = json.loads(text)
     except ValueError:
-        result.errors.append(f"{stream}:{line_no}: malformed loop-benchmarks kernel_cycle JSON")
+        result.error("kernel_cycle", f"{stream}:{line_no}: malformed loop-benchmarks kernel_cycle JSON")
         return
     # Hosted benchmarks report elapsed_ns; never treat those values as cycles.
     if record.get("metric") != "cycles":
@@ -99,7 +119,7 @@ def parse_loop_benchmark(text, result, stream, line_no):
             or type(record.get("repetitions")) is not int or record["repetitions"] < 1
             or type(record.get("warmups")) is not int or record["warmups"] < 0
             or type(record.get("value")) is not int):
-        result.errors.append(f"{stream}:{line_no}: invalid loop-benchmarks kernel_cycle record")
+        result.error("kernel_cycle", f"{stream}:{line_no}: invalid loop-benchmarks kernel_cycle record")
         return
     # Both modes time only bench_kernel calls. value is the sum over repetitions,
     # excluding warmups; preserve that sum without averaging or subtracting overhead.
@@ -121,7 +141,7 @@ def parse_lines(backend, lines):
             result.add("kernel_cycle", marker[1], integer(marker[2]), stream, line_no,
                        "RVV_KERNEL", "kernel")
         elif "RVV_KERNEL" in text:
-            result.errors.append(f"{stream}:{line_no}: malformed RVV_KERNEL marker")
+            result.error("kernel_cycle", f"{stream}:{line_no}: malformed RVV_KERNEL marker")
         parse_loop_benchmark(text, result, stream, line_no)
         if backend.startswith("xiangshan"):
             result.good |= "HIT GOOD TRAP" in text

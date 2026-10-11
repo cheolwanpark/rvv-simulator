@@ -1,20 +1,19 @@
 """One writer, uncompressed standard SQLite types, and an analysis view."""
 
-import codecs
 from contextlib import contextmanager
-from datetime import datetime, timezone
 import fcntl
 import hashlib
 import json
-import os
 from pathlib import Path
 import sqlite3
+import shutil
 
-SCHEMA_VERSION = 1
-CHUNK_BYTES = 64 * 1024
+from .artifacts import file_hash, log_chunks, now, regular_file
+
+SCHEMA_VERSION = 2
 
 SCHEMA = """
-PRAGMA user_version = 1;
+PRAGMA user_version = 2;
 CREATE TABLE run (
  id TEXT PRIMARY KEY, schema_version INTEGER NOT NULL, backend TEXT NOT NULL,
  image_id TEXT NOT NULL, image_ref TEXT NOT NULL, input_dir TEXT NOT NULL,
@@ -33,14 +32,13 @@ CREATE TABLE artifacts (
 CREATE UNIQUE INDEX elf_hash ON artifacts(sha256) WHERE kind='elf';
 CREATE TABLE jobs (
  job_id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE,
- elf_artifact_id INTEGER NOT NULL REFERENCES artifacts(artifact_id),
- validation_error TEXT
+ elf_artifact_id INTEGER NOT NULL REFERENCES artifacts(artifact_id)
 );
 CREATE TABLE attempts (
  attempt_id INTEGER PRIMARY KEY, job_id INTEGER NOT NULL REFERENCES jobs(job_id),
  attempt_no INTEGER NOT NULL, status TEXT NOT NULL, started_at TEXT NOT NULL,
  finished_at TEXT, wall_seconds REAL, exit_code INTEGER, reason TEXT,
- container_name TEXT UNIQUE, cpu INTEGER, command_json TEXT NOT NULL,
+ container_name TEXT UNIQUE, cpu INTEGER, command_json TEXT NOT NULL, settings_json TEXT NOT NULL,
  total_cycle INTEGER, measurement_status TEXT NOT NULL DEFAULT 'pending',
  kernel_status TEXT NOT NULL DEFAULT 'pending', UNIQUE(job_id, attempt_no)
 );
@@ -80,10 +78,6 @@ CREATE VIEW job_results AS
 """
 
 
-def now():
-    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
-
-
 def sha256(data):
     return hashlib.sha256(data).hexdigest()
 
@@ -104,7 +98,10 @@ def run_lock(path):
 
 class Store:
     def __init__(self, path, create=False):
-        self.path = Path(path)
+        path = Path(path).absolute()
+        if path.is_symlink():
+            raise ValueError("result database must not be a symlink")
+        self.path = path.parent.resolve() / path.name
         if create:
             # Exclusive creation, including protection against dangling symlinks.
             with self.path.open("xb"):
@@ -113,15 +110,18 @@ class Store:
             raise ValueError(f"database not found: {path}")
         self.db = sqlite3.connect(self.path)
         self.db.row_factory = sqlite3.Row
-        self.db.execute("PRAGMA foreign_keys=ON")
-        self.db.execute("PRAGMA busy_timeout=5000")
-        if create:
-            self.db.executescript(SCHEMA)
-        elif self.db.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
+        try:
+            self.db.execute("PRAGMA foreign_keys=ON")
+            self.db.execute("PRAGMA busy_timeout=5000")
+            if create:
+                self.db.executescript(SCHEMA)
+            elif self.db.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
+                raise ValueError("unsupported SQLite schema version; resume this database with the original tool version")
+            self.db.execute("PRAGMA journal_mode=WAL")
+            self.db.execute("PRAGMA synchronous=FULL")
+        except BaseException:
             self.db.close()
-            raise ValueError("unsupported SQLite schema version")
-        self.db.execute("PRAGMA journal_mode=WAL")
-        self.db.execute("PRAGMA synchronous=FULL")
+            raise
 
     def close(self):
         try:
@@ -148,70 +148,6 @@ class Store:
             "VALUES(?,?,?,'sqlite',?,?,?)", (attempt_id, kind, name, digest, len(data), data)
         ).lastrowid
 
-    def ingest(self, attempt_id, directory, final=False):
-        """Durable offsets make ingestion idempotent after an unclean controller exit."""
-        for stream in ("stdout", "stderr"):
-            path = Path(directory) / f"{stream}.log"
-            if not path.exists():
-                continue
-            if path.is_symlink() or not path.is_file():
-                raise ValueError(f"unexpected log file: {path}")
-            last = self.db.execute(
-                "SELECT sequence,byte_offset+byte_length FROM logs WHERE attempt_id=? AND stream=? "
-                "ORDER BY sequence DESC LIMIT 1", (attempt_id, stream)).fetchone()
-            sequence, offset = (last[0] + 1, last[1]) if last else (0, 0)
-            if path.stat().st_size < offset:
-                raise ValueError(f"log was truncated: {path}")
-            with path.open("rb") as handle:
-                handle.seek(offset)
-                # Bound each polling pass; on completion drain the entire file.
-                remaining = None if final else 32
-                while remaining is None or remaining > 0:
-                    data = handle.read(CHUNK_BYTES)
-                    if not data:
-                        break
-                    try:
-                        text, raw = data.decode("utf-8"), None
-                    except UnicodeDecodeError as error:
-                        if error.reason == "unexpected end of data" and error.start > 0:
-                            # Keep valid multibyte characters intact across chunk/poll boundaries.
-                            handle.seek(error.start - len(data), os.SEEK_CUR)
-                            data = data[:error.start]
-                            text, raw = data.decode("utf-8"), None
-                        elif error.reason == "unexpected end of data" and not final:
-                            break
-                        else:
-                            text, raw = data.decode("utf-8", "replace"), data
-                    self.db.execute("INSERT INTO logs VALUES(?,?,?,?,?,?,?)",
-                                    (attempt_id, stream, sequence, offset, len(data), text, raw))
-                    offset += len(data)
-                    sequence += 1
-                    if remaining is not None:
-                        remaining -= 1
-
-    def lines(self, attempt_id):
-        for stream in ("stdout", "stderr"):
-            decoder = codecs.getincrementaldecoder("utf-8")("replace")
-            pending, line_no = "", 0
-            rows = self.db.execute(
-                "SELECT text,raw_bytes FROM logs WHERE attempt_id=? AND stream=? ORDER BY sequence",
-                (attempt_id, stream))
-            for row in rows:
-                pending += decoder.decode(row[1] if row[1] is not None else row[0].encode("utf-8"))
-                parts = pending.split("\n")
-                pending = parts.pop()
-                for line in parts:
-                    line_no += 1
-                    yield stream, line_no, line
-                # Simulator output is line-oriented; bound malformed unbroken output.
-                if len(pending) > 1024 * 1024:
-                    line_no += 1
-                    yield stream, line_no, pending
-                    pending = ""
-            pending += decoder.decode(b"", final=True)
-            if pending:
-                yield stream, line_no + 1, pending
-
     def run(self):
         row = self.db.execute("SELECT * FROM run").fetchone()
         if row is None:
@@ -224,10 +160,132 @@ class Store:
             self.db.execute(f"INSERT INTO run({','.join(keys)}) VALUES({','.join('?' for _ in keys)})",
                             tuple(config.values()))
             count = 0
-            for i, (name, data, error) in enumerate(workloads, 1):
+            for i, (name, data) in enumerate(workloads, 1):
                 artifact = self.blob("elf", name, data)
-                self.db.execute("INSERT INTO jobs VALUES(?,?,?,?)", (i, name, artifact, error))
+                self.db.execute("INSERT INTO jobs VALUES(?,?,?)", (i, name, artifact))
                 count = i
             for name, data in manifests.items():
                 self.blob("manifest", name, data)
             self.event("created", json.dumps({"jobs": count}))
+
+    def resume_settings(self, jobs, timeout, max_cycles):
+        previous = self.run()
+        with self.db:
+            self.db.execute("UPDATE run SET jobs=?,timeout=?,max_cycles=?,updated_at=?",
+                            (jobs, timeout, max_cycles, now()))
+            self.event("resume", f"jobs={jobs}; timeout={timeout}; previous_timeout={previous['timeout']}; "
+                       f"max_cycles={max_cycles}; previous_max_cycles={previous['max_cycles']}")
+
+    def set_status(self, status, message):
+        with self.db:
+            self.db.execute("UPDATE run SET status=?,updated_at=?", (status, now()))
+            self.event(status, message)
+
+    def jobs(self, pending=False):
+        where = "WHERE r.status != 'succeeded'" if pending else ""
+        return [dict(row) for row in self.db.execute(
+            f"SELECT j.*,r.status FROM jobs j JOIN job_results r USING(job_id) {where} ORDER BY j.job_id")]
+
+    def attempts(self):
+        return [dict(row) for row in self.db.execute(
+            "SELECT a.*,EXISTS(SELECT 1 FROM artifacts ar WHERE ar.attempt_id=a.attempt_id "
+            "AND ar.kind='result') AS imported FROM attempts a ORDER BY attempt_id")]
+
+    def manifests(self):
+        return {row[0]: row[1] for row in self.db.execute(
+            "SELECT name,data FROM artifacts WHERE kind='manifest'")}
+
+    def input_bytes(self, job):
+        row = self.db.execute("SELECT data,sha256 FROM artifacts WHERE artifact_id=?",
+                              (job['elf_artifact_id'],)).fetchone()
+        if sha256(row[0]) != row[1]:
+            raise ValueError(f"stored ELF hash mismatch: {job['name']}")
+        return row[0]
+
+    def start_attempt(self, job, spec):
+        with self.db:
+            number = self.db.execute("SELECT COALESCE(MAX(attempt_no),0)+1 FROM attempts WHERE job_id=?",
+                                     (job['job_id'],)).fetchone()[0]
+            self.db.execute(
+                "INSERT INTO attempts(attempt_id,job_id,attempt_no,status,started_at,container_name,cpu,command_json,settings_json) "
+                "VALUES(?,?,?,'running',?,?,?,?,?)",
+                (spec.attempt_id, job['job_id'], number, spec.started_at, spec.container, spec.cpu,
+                 json.dumps(spec.command), json.dumps(spec.settings())))
+            self.event("start", job['name'], spec.attempt_id)
+
+    def interrupt_attempt(self, attempt_id):
+        with self.db:
+            self.db.execute("UPDATE attempts SET status='interrupted',finished_at=?,reason=? WHERE attempt_id=?",
+                            (now(), "controller interrupted before result publication", attempt_id))
+            self.event("interrupted", "unfinished execution will be retried", attempt_id)
+
+    def import_result(self, directory, result):
+        """Copy files first; commit the complete result once; caller then removes staging."""
+        attempt_id = result.attempt_id
+        attempt = self.db.execute("SELECT * FROM attempts WHERE attempt_id=?", (attempt_id,)).fetchone()
+        if attempt is None:
+            raise ValueError("completed result has no matching attempt")
+        expected = self.db.execute("SELECT ar.sha256 FROM jobs j JOIN artifacts ar "
+                                   "ON ar.artifact_id=j.elf_artifact_id WHERE j.job_id=?",
+                                   (attempt['job_id'],)).fetchone()[0]
+        if (result.run_id != self.run()['id'] or result.input_sha256 != expected
+                or result.settings != json.loads(attempt['settings_json'])
+                or result.started_at != attempt['started_at']):
+            raise ValueError("completed result does not match its attempt")
+        if attempt['status'] != 'running':
+            return  # Already committed; only cleanup remains after a controller crash.
+        destination = Path(str(self.path) + '.artifacts') / str(attempt['job_id']) / f"attempt-{attempt['attempt_no']}"
+        external = []
+        for item in result.files:
+            relative = Path(item['path'])
+            if relative.parts[0] != 'output' or relative.as_posix() in ('output/stdout.log', 'output/stderr.log'):
+                continue
+            source = regular_file(directory, relative)
+            name = relative.relative_to('output')
+            target = destination / name
+            for parent in (target, *target.parents):
+                if parent.is_symlink():
+                    raise ValueError(f"refusing artifact symlink: {parent}")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, target)
+            if file_hash(target) != item['sha256']:
+                raise ValueError(f"artifact copy hash mismatch: {target}")
+            external.append((name.as_posix(), target, item))
+        with self.db:
+            for stream in ('stdout', 'stderr'):
+                offset = 0
+                for sequence, (data, text, raw) in enumerate(log_chunks(regular_file(directory, f'output/{stream}.log'))):
+                    self.db.execute("INSERT INTO logs VALUES(?,?,?,?,?,?,?)",
+                                    (attempt_id, stream, sequence, offset, len(data), text, raw))
+                    offset += len(data)
+            counts = {}
+            for measurement in result.measurements:
+                key = measurement['metric'], measurement['scope'], measurement['name']
+                index = counts.get(key, 0)
+                counts[key] = index + 1
+                self.db.execute(
+                    "INSERT INTO measurements(attempt_id,metric,scope,name,sample_index,value,source_stream,"
+                    "source_line,source,validity) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (attempt_id, *key, index, measurement['value'], measurement['source_stream'],
+                     measurement['source_line'], measurement['source'],
+                     'complete' if result.status == 'succeeded' else 'partial'))
+            for name, target, item in external:
+                self.db.execute(
+                    "INSERT INTO artifacts(attempt_id,kind,name,storage,sha256,size_bytes,relative_path) "
+                    "VALUES(?,?,?,'external',?,?,?)",
+                    (attempt_id, 'wave' if name == 'wave.fst' else 'auxiliary', name,
+                     item['sha256'], item['size_bytes'], target.relative_to(self.path.parent).as_posix()))
+            self.blob('result', 'result.json', (Path(directory) / 'result.json').read_bytes(), attempt_id)
+            self.db.execute(
+                "UPDATE attempts SET status=?,finished_at=?,wall_seconds=?,exit_code=?,reason=?,total_cycle=?,"
+                "measurement_status=?,kernel_status=? WHERE attempt_id=?",
+                (result.status, result.finished_at, result.wall_seconds, result.exit_code, result.reason,
+                 result.total_cycle, result.measurement_status, result.kernel_status, attempt_id))
+            for error in result.errors:
+                self.event('measurement_error', error['message'], attempt_id)
+            self.event('finish', result.status, attempt_id)
+
+    def failed(self):
+        return bool(self.db.execute(
+            "SELECT COUNT(*) FROM job_results WHERE status != 'succeeded' "
+            "OR measurement_status IN ('invalid','missing_total')").fetchone()[0])

@@ -1,0 +1,5 @@
+#!/usr/bin/env python3
+import sys
+from rvv_batch.cli import main
+
+raise SystemExit(main(['run-single', *sys.argv[1:]]))

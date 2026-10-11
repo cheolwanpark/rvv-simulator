@@ -1,4 +1,4 @@
-# SQLite schema v1
+# SQLite schema v2
 
 The database is the result artifact and resume state for exactly one request.
 It requires only standard SQLite. All BLOBs contain original bytes; no compression,
@@ -11,8 +11,8 @@ is the schema compatibility version; incompatible versions are rejected on resum
 | Table | Key and principal columns |
 | --- | --- |
 | `run` | `id` request UUID; `schema_version`, `parser_version`, `tool_version`, `backend`, `image_id`, `image_ref`, `input_dir`, `created_at`, `updated_at`, `status`, `jobs`, `seed`, `max_cycles`, `timeout`, `wave`, `cpu_set`, `memory` |
-| `jobs` | `job_id` (1-based sorted input index), unique `name` (original relative path), `elf_artifact_id`, `validation_error` |
-| `attempts` | `attempt_id`, `job_id`, `attempt_no` (1-based per job), `status`, `started_at`, `finished_at`, `wall_seconds`, `exit_code`, `reason`, `container_name`, `cpu`, `command_json`, `total_cycle`, `measurement_status`, `kernel_status` |
+| `jobs` | `job_id` (1-based sorted input index), unique `name` (original relative path), `elf_artifact_id` |
+| `attempts` | `attempt_id`, `job_id`, `attempt_no` (1-based per job), `status`, `started_at`, `finished_at`, `wall_seconds`, `exit_code`, `reason`, `container_name`, `cpu`, `command_json`, `settings_json`, `total_cycle`, `measurement_status`, `kernel_status` |
 | `measurements` | `measurement_id`, `attempt_id`, `metric`, `scope`, `name`, `sample_index`, `value`, `source_stream`, `source_line`, `source`, `validity` |
 | `logs` | primary key (`attempt_id`, `stream`, `sequence`); `byte_offset`, `byte_length`, `text`, nullable `raw_bytes` |
 | `artifacts` | `artifact_id`, nullable `attempt_id`, `kind`, `name`, `storage`, `sha256`, `size_bytes`, `data`, `relative_path` |
@@ -25,13 +25,17 @@ records the effective jobs and limits, plus the previous limits. Each scheduler
 invocation records its CPU IDs in `events`. Other simulator settings remain
 unchanged. `command_json` is a standard JSON array of simulator argv strings, not
 shell code; the input pathname refers to the staged ELF inside the container.
+`settings_json` stores that attempt's effective settings, including its timeout,
+cycle limit, CPU and image identity. Resume overrides never rewrite older attempts.
 
 An ELF is stored once by content hash even when multiple jobs use identical bytes.
-`artifacts.kind='elf'` and `kind='manifest'` have `storage='sqlite'` with `data` BLOB.
+`artifacts.kind='elf'`, `kind='manifest'` and `kind='result'` have `storage='sqlite'` with `data` BLOB.
 Manifest artifacts include the image config, source revisions and Docker image
 inspection JSON. `wave` and `auxiliary` artifacts use `storage='external'` with
 `relative_path` relative to the database's directory. Their `data` is NULL. Log
-content lives in `logs`, not duplicated in `artifacts`.
+content lives in `logs`, not duplicated in `artifacts`. Each finalized attempt's
+`result` artifact contains the original `result.json` completion manifest (format 1),
+including its measurements, errors and original file inventory.
 
 ## Analysis view
 
@@ -73,8 +77,8 @@ kernel cycles over `repetitions` (positive integer), excluding `warmups` (nonneg
 integer), in either mode. The parser preserves this sum without averaging; the
 original JSON and its metadata remain in `logs`. Hosted `elapsed_ns` values are
 not cycle measurements. Invalid cycle records produce `measurement_error` events
-and invalid kernel/measurement statuses. The schema version remains 1; resume
-requires the same parser version as the original request.
+and invalid kernel/measurement statuses. Resume requires the same parser version
+as the original request.
 
 The final non-warmup core-0 `cycle` becomes XiangShan's `total_cycle`. Saturn uses
 the final patched `cycle`; `reported_cycle` is not silently used as a substitute.
@@ -91,8 +95,9 @@ Order between stdout and stderr is not inferred; per-stream order is preserved.
 `logs.sequence` starts at 0 per attempt and stream. Rows contain bounded chunks,
 not guaranteed complete lines. Valid UTF-8 characters are kept intact across rows.
 `text` is directly queryable, retaining ANSI codes and newline characters.
-`byte_offset` and `byte_length` describe the original byte stream and also make
-recovery ingestion idempotent.
+`byte_offset` and `byte_length` describe the original byte stream. Logs are imported
+once in the same transaction as the final attempt status. Running attempts have
+no log rows; their live output is available in the work directory.
 
 For invalid UTF-8, `text` contains replacement characters for readability and
 `raw_bytes` contains the original uncompressed bytes. The bytes of a row are
@@ -108,7 +113,7 @@ Attempt statuses:
 
 | Status | Meaning | Resume behavior |
 | --- | --- | --- |
-| `starting`, `running`, `stopping` | nonterminal attempt, possibly from a dead controller | recover outputs and container state first |
+| `running` | scheduled/executing attempt, possibly from a dead controller | import its completed result or mark interrupted |
 | `interrupted` | explicitly interrupted or unfinished when recovered | create another attempt |
 | `succeeded` | exit 0 and backend success marker, no failure marker | retain |
 | `failed` | nonzero exit, missing success marker, OOM, or missing requested waveform | create another attempt |
@@ -119,8 +124,9 @@ Attempt statuses:
 A job with no attempt appears as `pending` in the view and will be scheduled.
 After recovery, every job whose latest status is not `succeeded` is scheduled
 once per resume invocation. Failures during that invocation await the next resume;
-all previous attempts and their outputs are retained. Successful jobs are skipped
-regardless of measurement status. The wall timeout and cycle limit can be overridden for new
+all previous attempts are retained. Hard-crash partial output stays in the work
+directory. Successful jobs are skipped regardless of measurement status. The wall
+timeout and cycle limit can be overridden for new
 attempts during resume without changing previous results. A new request is
 required to change the input or other simulator settings.
 
@@ -130,11 +136,22 @@ required to change the input or other simulator settings.
 example, an uninstrumented successful program has `status='succeeded'`,
 `measurement_status='missing_kernel'`, and `kernel_cycle=NULL`.
 
-Logs are committed while simulations run. Measurements are parsed and committed
-when an attempt is finalized, including interruption recovery. External files are
-moved to deterministic attempt directories before indexing; recovery can re-index
-a file moved just before a crash. The terminal status is committed with the parsed
-samples and artifact index before `finish` is printed or the container removed.
+The executor parses output files directly and atomically publishes `result.json`
+after an attempt finishes, including timeouts and graceful interruptions. The
+scheduler imports this completed directory without ZIP creation or extraction.
+External files are copied to deterministic attempt directories first; logs,
+measurements, artifact indices and terminal status then commit together. Staging
+is removed and `finish` is printed after commit. Repeating an already committed
+import does not duplicate rows.
+
+On resume, leftover request containers are stopped/removed. Completed result
+manifests are checked against their attempt settings, input hash and file inventory
+before import. Attempts without a valid manifest are marked interrupted and retried;
+container exit state is not used to reconstruct results. Such interrupted attempts
+have no imported measurements and retain their partial directory for debugging.
+
+Schema v1 databases are rejected without migration or modification. Use the old
+tool to resume them; ordinary SQLite clients can still query their existing data.
 
 The scheduler is the only writer. WAL allows concurrent analysis while it runs.
 After clean shutdown/checkpoint the SQLite file can be copied by itself for

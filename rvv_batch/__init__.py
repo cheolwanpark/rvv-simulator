@@ -1,3 +1,3 @@
-"""Docker-backed RTL batches with plain SQLite results."""
+"""Single ELF execution and SQLite batch orchestration."""
 
-__version__ = "1.0.0"
+__version__ = "2.0.0"

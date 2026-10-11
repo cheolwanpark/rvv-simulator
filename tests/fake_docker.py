@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Process-level Docker test double; simulator children survive a killed controller.
+"""Small Docker CLI double for standalone, batch/resume and SIGINT checks.
 
 Not used by the runtime. Every mutation stays in RVV_FAKE_DOCKER_ROOT.
 """
@@ -54,40 +54,21 @@ def simulation(name):
     try:
         with (output / "stdout.log").open("w", buffering=1) as stdout, (output / "stderr.log").open("w", buffering=1) as stderr:
             stdout.write("fixture start 한글\n")
-            if "loop-json" in scenario:
-                record = json.dumps(dict(schema_version=2, mode="kernel", seed=0, repetitions=1,
-                                         warmups=0, metric="cycles", value=-1 if "invalid" in scenario else 123,
-                                         numerical_validation="not_run")) + "\n"
-                # Guest UART output arrives across polling boundaries, not whole lines.
-                stdout.write(record[:37])
-                stdout.flush()
-                time.sleep(0.3)
-                stdout.write(record[37:])
-            elif "multiple" in scenario:
-                stdout.write("RVV_KERNEL name=first cycles=11\nRVV_KERNEL name=second cycles=22\n")
-            elif "missing" not in scenario:
-                stdout.write("RVV_KERNEL name=kernel cycles=123\n")
-            if "invalid-marker" in scenario:
-                stdout.write("RVV_KERNEL name=bad cycles=-1\n")
+            stdout.write("RVV_KERNEL name=kernel cycles=123\n")
             if "long" in scenario:
                 time.sleep(30)
-            elif "slow" in scenario:
-                time.sleep(1)
             else:
                 time.sleep(0.25)
-            if "cycle-limit" in scenario:
-                stderr.write("EXCEEDING CYCLE/INSTR LIMIT\n")
-            elif "fail" in scenario:
+            if "fail" in scenario:
                 stderr.write("HIT BAD TRAP at pc = 0x80000000\n*** FAILED *** code=1\n")
             else:
                 if "saturn" in item["Image"]:
                     stdout.write("SATURN simulation cycleCnt = 456\n")
                 else:
                     stderr.write("\x1b[32mHIT GOOD TRAP at pc = 0x80000000\x1b[0m\n")
-                    if "no-total" not in scenario:
-                        stdout.write("Core-0 instrCnt = 321, cycleCnt = 456, IPC = 0.7039\n")
+                    stdout.write("Core-0 instrCnt = 321, cycleCnt = 456, IPC = 0.7039\n")
                     stdout.write("Seed=1 Guest cycle spent: 460\n")
-                if "--wave" in item["command"] and "no-wave" not in scenario:
+                if "--wave" in item["command"]:
                     (output / "wave.fst").write_bytes(b"fixture FST\x00\xff")
         finish(1 if "fail" in scenario else 0)
     except BaseException:
@@ -142,9 +123,6 @@ def main(args):
         item["pid"] = process.pid
         save(item)
     elif command == "inspect":
-        delay = float(os.environ.get("RVV_FAKE_INSPECT_DELAY", "0"))
-        if delay:
-            time.sleep(delay)
         print(json.dumps([read(name) for name in args[1:]]))
     elif command == "ps":
         label = args[args.index("--filter") + 1].removeprefix("label=")

@@ -6,3 +6,5 @@ results/
 *.sqlite.lock
 *.sqlite.work/
 *.sqlite.artifacts/
+*.zip.work/
+*.zip.tmp
