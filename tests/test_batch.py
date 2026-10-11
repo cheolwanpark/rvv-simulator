@@ -333,32 +333,46 @@ class BatchIntegrationTests(unittest.TestCase):
         self.assertEqual(db.execute("SELECT * FROM attempts WHERE attempt_no=1 ORDER BY attempt_id").fetchall(),
                          original_attempts)
 
-    def test_resume_rejects_invalid_timeout_without_changes(self):
+    def test_resume_rejects_invalid_limits_without_changes(self):
         self.add("one.elf")
         result = self.invoke()
         self.assertEqual(result.returncode, 0, result.stderr)
         db = self.connection()
         original_run = db.execute("SELECT * FROM run").fetchone()
         original_calls = self.calls()
-        for value in ("0", "-1", "nan", "inf", "invalid"):
-            with self.subTest(timeout=value):
-                rejected = self.invoke("--timeout", value, resume=True)
-                self.assertEqual(rejected.returncode, 2, rejected.stderr)
-                self.assertIn("positive seconds", rejected.stderr)
-                self.assertEqual(db.execute("SELECT * FROM run").fetchone(), original_run)
-                self.assertEqual(self.calls(), original_calls)
+        for flag, values in (("--timeout", ("0", "-1", "nan", "inf", "invalid")),
+                             ("--max-cycles", ("0", "-1", "1.5", "nan", "inf", "invalid", str(2**63)))):
+            for value in values:
+                with self.subTest(flag=flag, value=value):
+                    rejected = self.invoke(flag, value, resume=True)
+                    self.assertEqual(rejected.returncode, 2, rejected.stderr)
+                    self.assertIn("positive", rejected.stderr)
+                    self.assertEqual(db.execute("SELECT * FROM run").fetchone(), original_run)
+                    self.assertEqual(self.calls(), original_calls)
 
-    def test_resume_retries_cycle_limit(self):
+    def test_resume_retries_cycle_limit_with_saved_override(self):
         self.add("limit.elf", "cycle-limit")
-        result = self.invoke()
+        result = self.invoke("--max-cycles", "100")
         self.assertEqual(result.returncode, 1, result.stderr)
         db = self.connection()
         self.assertEqual(db.execute("SELECT status FROM job_results").fetchone()[0], "cycle_limit")
-        resumed = self.invoke(resume=True)
+        original = db.execute("SELECT * FROM attempts").fetchone()
+        rejected = self.invoke("--jobs", "5", "--max-cycles", "200", resume=True)
+        self.assertEqual(rejected.returncode, 2, rejected.stderr)
+        self.assertEqual(db.execute("SELECT max_cycles FROM run").fetchone()[0], 100)
+        resumed = self.invoke("--max-cycles", "200", resume=True)
         self.assertEqual(resumed.returncode, 1, resumed.stderr)
         self.assertIn("finish [1/1] limit.elf", resumed.stdout)
+        event = db.execute("SELECT message FROM events WHERE kind='resume' ORDER BY event_id DESC LIMIT 1").fetchone()[0]
+        self.assertIn("max_cycles=200; previous_max_cycles=100", event)
+        inherited = self.invoke(resume=True)
+        self.assertEqual(inherited.returncode, 1, inherited.stderr)
+        self.assertEqual(db.execute("SELECT max_cycles FROM run").fetchone()[0], 200)
+        self.assertEqual(db.execute("SELECT * FROM attempts WHERE attempt_no=1").fetchone(), original)
         self.assertEqual([tuple(r) for r in db.execute("SELECT attempt_no,status FROM attempts ORDER BY attempt_no")],
-                         [(1, "cycle_limit"), (2, "cycle_limit")])
+                         [(1, "cycle_limit"), (2, "cycle_limit"), (3, "cycle_limit")])
+        creates = [call for call in self.calls() if call[0] == "create"]
+        self.assertEqual([cmd[cmd.index("--max-cycles") + 1] for cmd in creates], ["100", "200", "200"])
 
     def test_progress_counts_completions_independently_of_job_ids(self):
         self.add("a-long.elf", "long")
@@ -502,10 +516,12 @@ class BatchIntegrationTests(unittest.TestCase):
                                  f"DOCKER={self.docker}", "WAVE=0"], cwd=ROOT, env=self.env, capture_output=True, text=True, timeout=15)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.connection().execute("SELECT wave FROM run").fetchone()[0], 0)
-        resumed = subprocess.run(["make", "resume", f"DB={self.database}", f"DOCKER={self.docker}", "TIMEOUT=7200"],
+        resumed = subprocess.run(["make", "resume", f"DB={self.database}", f"DOCKER={self.docker}",
+                                  "TIMEOUT=7200", "MAX_CYCLES=20000000"],
                                  cwd=ROOT, env=self.env, capture_output=True, text=True, timeout=15)
         self.assertEqual(resumed.returncode, 0, resumed.stderr)
         self.assertEqual(self.connection().execute("SELECT timeout FROM run").fetchone()[0], 7200)
+        self.assertEqual(self.connection().execute("SELECT max_cycles FROM run").fetchone()[0], 20000000)
 
 
 class StoreTests(unittest.TestCase):

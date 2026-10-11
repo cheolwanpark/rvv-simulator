@@ -57,6 +57,7 @@ def parser():
     resume.add_argument("database", type=Path)
     resume.add_argument("--jobs", type=positive, help="override previous scheduler concurrency")
     resume.add_argument("--timeout", type=seconds, help="override and save the per-attempt wall timeout in seconds")
+    resume.add_argument("--max-cycles", type=positive, help="override and save the per-attempt simulator cycle limit")
     resume.add_argument("--docker", default=os.environ.get("DOCKER", "docker"), help="Docker executable")
     return root
 
@@ -107,10 +108,12 @@ def run(args, docker=None):
                 if image_id != config["image_id"]:
                     raise ValueError("resume requires the original immutable image ID")
                 timeout = args.timeout if args.timeout is not None else config["timeout"]
+                max_cycles = args.max_cycles if args.max_cycles is not None else config["max_cycles"]
                 with store.db:
-                    if args.timeout is not None:
-                        store.db.execute("UPDATE run SET timeout=?,updated_at=?", (timeout, now()))
-                    store.event("resume", f"jobs={jobs}; timeout={timeout}; previous_timeout={config['timeout']}")
+                    if args.timeout is not None or args.max_cycles is not None:
+                        store.db.execute("UPDATE run SET timeout=?,max_cycles=?,updated_at=?", (timeout, max_cycles, now()))
+                    store.event("resume", f"jobs={jobs}; timeout={timeout}; previous_timeout={config['timeout']}; "
+                                f"max_cycles={max_cycles}; previous_max_cycles={config['max_cycles']}")
             result = Runner(store, docker, cpus, jobs).execute()
         finally:
             if store is not None:

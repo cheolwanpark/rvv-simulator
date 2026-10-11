@@ -23,14 +23,14 @@ make run ELF_DIR=./elfs BACKEND=xiangshan-v3 JOBS=8 \
 # After interruption: same DB, original ELF bytes and immutable image ID.
 make resume DB=./results/experiment.sqlite JOBS=4
 
-# Retry with a longer wall timeout (saved for subsequent resumes).
-make resume DB=./results/experiment.sqlite TIMEOUT=7200
+# Override either or both limits (saved for subsequent resumes).
+make resume DB=./results/experiment.sqlite TIMEOUT=7200 MAX_CYCLES=20000000
 
 # Direct CLI equivalents:
 ./rvv-batch run ./elfs --backend xiangshan-v3 --jobs 8 \
     --output ./results/experiment-2.sqlite
 ./rvv-batch resume ./results/experiment-2.sqlite --jobs 4
-./rvv-batch resume ./results/experiment-2.sqlite --timeout 7200
+./rvv-batch resume ./results/experiment-2.sqlite --timeout 7200 --max-cycles 20000000
 ```
 
 `BACKEND` is `xiangshan-v2`, `xiangshan-v3` or `saturn`. One request uses one
@@ -50,9 +50,10 @@ required for `make resume`. Relative paths are relative to the working directory
 | `DOCKER` | `--docker` | `docker` |
 
 `CPU_SET=0,2,4,6`, `MEMORY=8g` and paths with spaces are supported. `PYTHON` selects
-the Python executable for Make. Resume inherits its previous concurrency and wall
-timeout when `JOBS` and `TIMEOUT` are omitted. Overrides are saved in the DB for
-subsequent resumes. `TIMEOUT` must be a finite positive number of seconds. Other
+the Python executable for Make. Resume inherits its previous concurrency, wall
+timeout and cycle limit when `JOBS`, `TIMEOUT` and `MAX_CYCLES` are omitted.
+Overrides are saved in the DB for subsequent resumes. `TIMEOUT` must be a finite
+positive number of seconds; `MAX_CYCLES` must be a positive SQLite integer. Other
 simulation settings come from the DB and cannot change during resume.
 
 Every simulator has **one Verilator model thread and one logical CPU**. The runner
@@ -227,14 +228,15 @@ may leave containers running; resume identifies them by request labels and stops
 them before retrying.
 
 Resume keeps the same request ID, ELF snapshots, image ID and simulator settings,
-while allowing concurrency and the wall timeout to change. It retains
+while allowing concurrency, the wall timeout and cycle limit to change. It retains
 all attempt history and executes every job whose latest status is not `succeeded`,
 including `pending`, `interrupted`, `failed`, `timeout`, `cycle_limit`, and
 `invalid_input`. Each job gets at most one new attempt per resume invocation;
 another failure is not retried again until the next resume. Invalid inputs are
 rejected again from the stored validation result without launching a simulator.
 Successful jobs are retained even if their measurements are missing or invalid.
-Use `--timeout` (Make: `TIMEOUT`) to change the wall timeout for new attempts;
+Use `--timeout` (Make: `TIMEOUT`) or `--max-cycles` (Make: `MAX_CYCLES`) to change
+the wall timeout or simulator cycle limit for new attempts;
 previous attempt results remain unchanged. Create a new request to change the
 inputs or other simulator settings. A simulator that exited before the controller
 died is finalized from its existing outputs first; it is rerun only if the

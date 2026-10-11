@@ -19,9 +19,9 @@ is the schema compatibility version; incompatible versions are rejected on resum
 | `events` | `event_id`, `time`, nullable `attempt_id`, `kind`, `message` |
 
 `image_id` is the immutable Docker image used for every attempt. `image_ref` records
-the originally requested tag or ID. Resume changes `run.jobs` and `run.timeout`
+the originally requested tag or ID. Resume changes `run.jobs`, `run.timeout` and `run.max_cycles`
 when requested; omitted overrides inherit the saved values. Each `resume` event
-records the effective jobs, timeout and previous timeout, and each scheduler
+records the effective jobs and limits, plus the previous limits. Each scheduler
 invocation records its CPU IDs in `events`. Other simulator settings remain
 unchanged. `command_json` is a standard JSON array of simulator argv strings, not
 shell code; the input pathname refers to the staged ELF inside the container.
@@ -120,7 +120,7 @@ A job with no attempt appears as `pending` in the view and will be scheduled.
 After recovery, every job whose latest status is not `succeeded` is scheduled
 once per resume invocation. Failures during that invocation await the next resume;
 all previous attempts and their outputs are retained. Successful jobs are skipped
-regardless of measurement status. The wall timeout can be overridden for new
+regardless of measurement status. The wall timeout and cycle limit can be overridden for new
 attempts during resume without changing previous results. A new request is
 required to change the input or other simulator settings.
 

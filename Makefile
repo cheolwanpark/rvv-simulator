@@ -9,7 +9,7 @@ export ELF_DIR BACKEND DB JOBS WAVE SEED MAX_CYCLES TIMEOUT IMAGE CPU_SET MEMORY
 help:
 	@echo 'make run ELF_DIR=./elfs BACKEND=xiangshan-v2|xiangshan-v3|saturn DB=./results/run.sqlite [JOBS=1]'
 	@echo '         [WAVE=0|1] [SEED=1] [MAX_CYCLES=10000000] [TIMEOUT=3600] [IMAGE=tag] [CPU_SET=0-7] [MEMORY=8g]'
-	@echo 'make resume DB=./results/run.sqlite [JOBS=N] [TIMEOUT=seconds]'
+	@echo 'make resume DB=./results/run.sqlite [JOBS=N] [TIMEOUT=seconds] [MAX_CYCLES=N]'
 	@echo 'make test | build BACKEND=... | smoke BACKEND=...'
 	@echo 'One simulator thread and one logical CPU per job. Waveforms are off by default.'
 
